@@ -25,14 +25,14 @@ export async function migrateDatabase(pool) {
 
     for (const [index, fileName] of migrationFiles.entries()) {
       const sql = fs.readFileSync(path.join(migrationsDirectory, fileName), 'utf8');
-      const checksum = createHash(sql);
+      const checksum = createHash(normalizeLineEndings(sql));
       const existing = await client.query(
         'SELECT checksum FROM schema_migrations WHERE id = $1',
         [fileName],
       );
 
       if (existing.rowCount > 0) {
-        if (existing.rows[0].checksum !== checksum) {
+        if (!migrationChecksumMatches(sql, existing.rows[0].checksum)) {
           throw new Error(`Migration checksum changed: ${fileName}`);
         }
         continue;
@@ -56,6 +56,17 @@ export async function migrateDatabase(pool) {
 
 function createHash(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function normalizeLineEndings(value) {
+  return value.replace(/\r\n?/g, '\n');
+}
+
+export function migrationChecksumMatches(sql, checksum) {
+  const normalizedSql = normalizeLineEndings(sql);
+  return checksum === createHash(normalizedSql)
+    || checksum === createHash(sql)
+    || checksum === createHash(normalizedSql.replace(/\n/g, '\r\n'));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
