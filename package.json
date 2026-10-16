@@ -1,0 +1,28 @@
+{
+  "name": "erp-system",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
+    "build": "echo \"No build required for this ERP prototype\"",
+    "db:migrate": "node scripts/migrate.js",
+    "db:import-legacy-banking": "node scripts/importLegacyBanking.js",
+    "db:seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.23.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.2",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.10"
+  }
+}

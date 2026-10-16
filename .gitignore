@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.local
+*.log
+/Git/
+cookies.txt
+erp-data.json
+backend/erp.db
+inventory-test.tap
+.venv/
+.pytest_cache/
+__pycache__/
+dist/
+coverage/
+.DS_Store
