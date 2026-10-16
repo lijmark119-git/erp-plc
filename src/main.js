@@ -29,6 +29,8 @@ import {
   state,
 } from './erpCore.js';
 import { getNavigationForDisplay, getNavigationKeyFromHash, getVisibleNavigation, resolveNavigationRoute } from './navigation.js';
+import { getAttendanceCalendarDay } from './ethiopianCalendar.js';
+import { renderGovernancePage } from './governance.js';
 
 const root = document.getElementById('root');
 const authState = {
@@ -38,6 +40,13 @@ const authState = {
   dataLoadError: '',
 };
 const navigationState = { key: 'dashboard' };
+const governanceState = {
+  tab: 'overview',
+  loading: false,
+  data: null,
+  error: '',
+  message: '',
+};
 const legacyUiPermissions = {
   ADMIN: new Set(['finance:transactions:manage']),
   MANAGER: new Set(['procurement:orders:manage']),
@@ -96,6 +105,11 @@ function navigateTo(key, replace = false) {
   }
   closeSidebar();
   render();
+  if (route.menu === 'governance' && !governanceState.data && !governanceState.loading) {
+    loadGovernanceData().then(() => {
+      if (state.activeMenu === 'governance') render();
+    });
+  }
   return true;
 }
 
@@ -156,6 +170,11 @@ const inventoryTransferState = {
   countStatusFilter: 'ALL',
   transfers: [],
   counts: [],
+  traceLots: [],
+  serialNumbers: [],
+  reservations: [],
+  traceLookup: null,
+  traceLookupError: '',
   products: [],
   warehouses: [],
   locations: [],
@@ -193,6 +212,7 @@ const pageTitles = {
   banking: ['Banking', 'Cash management'],
   reports: ['Reports', 'Performance insights'],
   settings: ['Settings', 'Business configuration'],
+  governance: ['Enterprise governance', 'Management and company-wide controls'],
 };
 const manufacturingState = {
   productionOrders: applicationData.productionOrders,
@@ -211,6 +231,7 @@ const manufacturingState = {
 const hrState = {
   tab: 'employees',
   attendancePeriod: '30',
+  attendanceMonth: attendanceDateKey().slice(0, 7),
   attendanceStartDate: '',
   attendanceEndDate: '',
   attendanceEmployeeId: 'ALL',
@@ -238,6 +259,9 @@ const salesState = {
   warehouses: [],
   reports: null,
   audit: [],
+  crmRecords: [],
+  activities: [],
+  disputes: [],
   error: '',
 };
 const procurementState = {
@@ -245,6 +269,9 @@ const procurementState = {
   suppliers: [],
   comparisons: [],
   orders: [],
+  requisitions: [],
+  supplierInvoices: [],
+  scorecards: [],
   loading: false,
   error: '',
 };
@@ -253,6 +280,7 @@ const accountingState = {
   accounts: [],
   periods: [],
   journals: [],
+  budgets: [],
   ledger: null,
   reports: {},
   error: '',
@@ -277,6 +305,61 @@ async function fetchJson(url, options = {}) {
   }
 
   return payload;
+}
+
+async function loadGovernanceData() {
+  if (governanceState.loading) return;
+  governanceState.loading = true;
+  governanceState.error = '';
+  try {
+    const data = await fetchJson('/api/governance');
+    if (!data || !Array.isArray(data.entities) || !Array.isArray(data.policies)) {
+      throw new Error('The governance workspace response is invalid.');
+    }
+    governanceState.data = data;
+  } catch (error) {
+    governanceState.error = error.message;
+  } finally {
+    governanceState.loading = false;
+  }
+}
+
+async function handleGovernanceFormSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = form.querySelector('.governance-form-error');
+  const collection = form.dataset.governanceForm;
+  const payload = Object.fromEntries(new FormData(form).entries());
+  if (error) error.textContent = '';
+  try {
+    await fetchJson(`/api/governance/${encodeURIComponent(collection)}`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    governanceState.message = 'Governance record created.';
+    await loadGovernanceData();
+    render();
+  } catch (requestError) {
+    if (error) error.textContent = requestError.message;
+  }
+}
+
+async function handleGovernanceStatus(button) {
+  const collection = button.dataset.governanceStatus;
+  const status = button.dataset.nextStatus;
+  button.disabled = true;
+  try {
+    await fetchJson(`/api/governance/${encodeURIComponent(collection)}/${encodeURIComponent(button.dataset.id)}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify(collection === 'approval-rules' ? { active: status === 'true' } : { status }),
+    });
+    governanceState.message = 'Governance record status updated.';
+    await loadGovernanceData();
+    render();
+  } catch (error) {
+    governanceState.message = error.message;
+    render();
+  }
 }
 
 async function loadApplicationData() {
@@ -367,15 +450,20 @@ async function loadDashboardData() {
 
 async function loadInventoryTransferData() {
   try {
-    const [transfers, counts, products, warehouses, locations, uoms] = await Promise.all([
+    const [transfers, counts, products, warehouses, locations, uoms, traceLots, serialNumbers, reservations] = await Promise.all([
       fetchJson('/api/inventory-management/transfers'),
       fetchJson('/api/inventory-management/counts'),
       fetchJson('/api/inventory-management/products?activeOnly=true'),
       fetchJson('/api/inventory-management/warehouses'),
       fetchJson('/api/inventory-management/locations'),
       fetchJson('/api/inventory-management/uoms'),
+      fetchJson('/api/inventory-management/trace/lots'),
+      fetchJson('/api/inventory-management/trace/serials'),
+      fetchJson('/api/inventory-management/reservations'),
     ]);
-    Object.assign(inventoryTransferState, { transfers, counts, products, warehouses, locations, uoms, error: '' });
+    Object.assign(inventoryTransferState, {
+      transfers, counts, products, warehouses, locations, uoms, traceLots, serialNumbers, reservations, error: '',
+    });
   } catch (error) {
     inventoryTransferState.error = error.message;
   }
@@ -451,6 +539,155 @@ async function handleInventoryStockReceiptSubmit(event) {
   } catch (requestError) {
     if (error) error.textContent = requestError.message;
   }
+}
+
+function parseInventorySerialNumbers(value) {
+  return String(value || '').split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+async function handleInventoryTraceReceiveSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = form.querySelector('.inventory-trace-error');
+  error.textContent = '';
+  const values = Object.fromEntries(new FormData(form).entries());
+  const payload = {
+    productId: values.productId,
+    warehouseId: values.warehouseId,
+    locationId: values.locationId || undefined,
+    quantity: Number(values.quantity),
+    unitCost: Number(values.unitCost),
+    referenceType: values.referenceType || 'PURCHASE_RECEIPT',
+    referenceId: values.referenceId || undefined,
+    lotNumber: values.lotNumber,
+    lotQuantity: Number(values.quantity),
+    expiryDate: values.expiryDate || undefined,
+    warrantyEndDate: values.warrantyEndDate || undefined,
+    lotBarcode: values.lotBarcode || undefined,
+    qualityStatus: values.qualityStatus,
+    serialNumbers: parseInventorySerialNumbers(values.serialNumbers),
+  };
+  if (!payload.serialNumbers.length) delete payload.serialNumbers;
+  try {
+    await fetchJson('/api/inventory-management/stock/receive', { method: 'POST', body: JSON.stringify(payload) });
+    await loadInventoryTransferData();
+    render();
+  } catch (requestError) {
+    error.textContent = requestError.message;
+  }
+}
+
+async function handleInventoryTrackedIssueSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = form.querySelector('.inventory-trace-error');
+  error.textContent = '';
+  const values = Object.fromEntries(new FormData(form).entries());
+  const payload = {
+    productId: values.productId,
+    warehouseId: values.warehouseId,
+    quantity: Number(values.quantity),
+    transactionType: 'MANUAL_ISSUE',
+    referenceType: values.referenceType || 'MANUAL_ISSUE',
+    referenceId: values.referenceId || undefined,
+    reservationId: values.reservationId || undefined,
+    serialNumbers: parseInventorySerialNumbers(values.serialNumbers),
+  };
+  if (!payload.serialNumbers.length) delete payload.serialNumbers;
+  try {
+    await fetchJson('/api/inventory-management/stock/issue', { method: 'POST', body: JSON.stringify(payload) });
+    await Promise.all([loadInventoryTransferData(), loadDashboardData()]);
+    render();
+  } catch (requestError) {
+    error.textContent = requestError.message;
+  }
+}
+
+async function handleInventoryReservationSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = form.querySelector('.inventory-trace-error');
+  error.textContent = '';
+  const values = Object.fromEntries(new FormData(form).entries());
+  const payload = {
+    productId: values.productId,
+    warehouseId: values.warehouseId,
+    locationId: values.locationId || undefined,
+    quantity: Number(values.quantity),
+    referenceType: values.referenceType || undefined,
+    referenceId: values.referenceId || undefined,
+    reason: values.reason || undefined,
+  };
+  try {
+    await fetchJson('/api/inventory-management/reservations', { method: 'POST', body: JSON.stringify(payload) });
+    await loadInventoryTransferData();
+    render();
+  } catch (requestError) {
+    error.textContent = requestError.message;
+  }
+}
+
+async function handleInventoryTraceLookupSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = form.querySelector('.inventory-trace-error');
+  error.textContent = '';
+  const code = new FormData(form).get('code');
+  try {
+    inventoryTransferState.traceLookup = await fetchJson(
+      `/api/inventory-management/trace/lookup?code=${encodeURIComponent(code)}`,
+    );
+    inventoryTransferState.traceLookupError = '';
+    render();
+  } catch (requestError) {
+    inventoryTransferState.traceLookup = null;
+    inventoryTransferState.traceLookupError = requestError.message;
+    render();
+  }
+}
+
+async function handleInventoryReservationRelease(reservationId) {
+  try {
+    await fetchJson(`/api/inventory-management/reservations/${encodeURIComponent(reservationId)}/release`, {
+      method: 'POST', body: JSON.stringify({}),
+    });
+    await loadInventoryTransferData();
+    render();
+  } catch (error) {
+    inventoryTransferState.error = error.message;
+    render();
+  }
+}
+
+async function handleInventoryLotQuality(lotId, qualityStatus) {
+  try {
+    await fetchJson(`/api/inventory-management/trace/lots/${encodeURIComponent(lotId)}/quality`, {
+      method: 'POST',
+      body: JSON.stringify({ qualityStatus, reason: 'Updated in inventory traceability.' }),
+    });
+    await loadInventoryTransferData();
+    render();
+  } catch (error) {
+    inventoryTransferState.error = error.message;
+    render();
+  }
+}
+
+function handleInventoryQrLabel(button) {
+  const container = button.closest('[data-qr-label-container]');
+  if (!container) return;
+  let image = container.querySelector('img');
+  if (!image) {
+    image = document.createElement('img');
+    image.alt = `QR label for ${button.dataset.qrCode}`;
+    image.loading = 'lazy';
+    image.src = `/api/inventory-management/trace/qr?code=${encodeURIComponent(button.dataset.qrCode)}`;
+    container.append(image);
+    button.textContent = 'Hide QR';
+    return;
+  }
+  image.remove();
+  button.textContent = 'QR label';
 }
 
 async function handleInventoryCountSubmit(event) {
@@ -611,7 +848,7 @@ async function loadManufacturingData() {
 
 async function loadAccountingData() {
   try {
-    const [accounts, periods, journals, trialBalance, profitAndLoss, balanceSheet, cashFlow] = await Promise.all([
+    const [accounts, periods, journals, trialBalance, profitAndLoss, balanceSheet, cashFlow, budgets] = await Promise.all([
       fetchJson('/api/accounting/accounts'),
       fetchJson('/api/accounting/periods'),
       fetchJson('/api/accounting/journals'),
@@ -619,9 +856,10 @@ async function loadAccountingData() {
       fetchJson('/api/accounting/reports/profit-and-loss'),
       fetchJson('/api/accounting/reports/balance-sheet'),
       fetchJson('/api/accounting/reports/cash-flow'),
+      fetchJson('/api/accounting/budgets'),
     ]);
     Object.assign(accountingState, {
-      accounts, periods, journals,
+      accounts, periods, journals, budgets,
       reports: { trialBalance, profitAndLoss, balanceSheet, cashFlow },
       error: '',
     });
@@ -636,7 +874,7 @@ async function loadAccountingData() {
 
 async function loadSalesData() {
   try {
-    const [customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit] = await Promise.all([
+    const [customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit, crm, disputes] = await Promise.all([
       fetchJson('/api/sales/customers'),
       fetchJson('/api/sales/quotations'),
       fetchJson('/api/sales/orders'),
@@ -647,8 +885,13 @@ async function loadSalesData() {
       fetchJson('/api/sales/warehouses'),
       fetchJson('/api/sales/reports'),
       fetchJson('/api/sales/audit'),
+      fetchJson('/api/sales/crm'),
+      hasRolePermission('sales:receivables:read') ? fetchJson('/api/sales/disputes') : Promise.resolve([]),
     ]);
-    Object.assign(salesState, { customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit, error: '' });
+    Object.assign(salesState, {
+      customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit,
+      crmRecords: crm.records || [], activities: crm.activities || [], disputes, error: '',
+    });
   } catch (error) {
     salesState.error = error.message;
   }
@@ -662,6 +905,9 @@ async function loadProcurementData() {
       suppliers: workspace.suppliers || [],
       comparisons: workspace.comparisons || [],
       orders: workspace.orders || [],
+      requisitions: workspace.requisitions || [],
+      supplierInvoices: workspace.supplierInvoices || [],
+      scorecards: workspace.scorecards || [],
       error: '',
     });
   } catch (error) {
@@ -683,6 +929,51 @@ async function handleProcurementSupplierSubmit(event) {
     render();
   } catch (requestError) {
     if (error) error.textContent = requestError.message;
+  }
+}
+
+async function handleProcurementControlSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = form.querySelector('.procurement-form-error');
+  if (error) error.textContent = '';
+  const values = Object.fromEntries(new FormData(form).entries());
+  const kind = form.dataset.procurementControl;
+  const endpoints = {
+    requisition: '/api/procurement/requisitions',
+    supplierInvoice: '/api/procurement/supplier-invoices',
+  };
+  const payload = { ...values };
+  for (const field of ['quantity', 'estimatedUnitCost', 'budgetLimit', 'invoiceQuantity', 'invoiceAmount']) {
+    if (field in payload) payload[field] = Number(payload[field]);
+  }
+  try {
+    await fetchJson(endpoints[kind], { method: 'POST', body: JSON.stringify(payload) });
+    await loadProcurementData();
+    render();
+  } catch (requestError) {
+    if (error) error.textContent = requestError.message;
+  }
+}
+
+async function handleProcurementControlledAction(button) {
+  const { action, id } = button.dataset;
+  try {
+    if (action === 'requisition-approve' || action === 'requisition-reject') {
+      const reason = window.prompt('Reason for requisition decision:');
+      if (!reason?.trim()) return;
+      await fetchJson(`/api/procurement/requisitions/${encodeURIComponent(id)}/decision`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: action === 'requisition-approve' ? 'APPROVED' : 'REJECTED', reason: reason.trim() }),
+      });
+    } else if (action === 'invoice-match') {
+      await fetchJson(`/api/procurement/supplier-invoices/${encodeURIComponent(id)}/match`, { method: 'POST', body: '{}' });
+    }
+    await loadProcurementData();
+    render();
+  } catch (error) {
+    procurementState.error = error.message;
+    render();
   }
 }
 
@@ -887,12 +1178,12 @@ async function handleLogout() {
 
 function renderSales() {
   const tabs = [
-    ['overview', 'Overview'], ['customers', 'Customers'], ['quotations', 'Quotations'],
+    ['overview', 'Overview'], ['crm', 'CRM & activity'], ['customers', 'Customers'], ['quotations', 'Quotations'],
     ['orders', 'Sales orders'], ['deliveries', 'Delivery'], ['invoices', 'Invoices'],
     ['payments', 'Payments'], ['receivables', 'Receivables'], ['reports', 'Reports'], ['creditHolds', 'Credit holds'],
   ];
   const active = tabs.some(([key]) => key === salesState.tab) ? salesState.tab : 'overview';
-  const field = (label, name, type = 'text', required = true, extra = '') => `<label>${label}<input name="${name}" type="${type}" ${required ? 'required' : ''} ${type === 'number' ? 'min="0" step="0.01"' : ''} ${extra} /></label>`;
+  const field = (label, name, type = 'text', required = true, extra = '') => `<label>${label}<input name="${name}" type="${type}" ${required ? 'required' : ''} ${type === 'number' ? 'min="0" step="0.01"' : ''} ${type === 'tel' ? 'inputmode="tel" pattern="[+0-9(). -]{7,24}" maxlength="24" title="Use 7-15 digits; standard phone punctuation is allowed."' : ''} ${name === 'contactPerson' ? 'maxlength="100" data-input-rule="person" title="Use letters, spaces, apostrophes, periods, or hyphens."' : ''} ${extra} /></label>`;
   const customerOptions = salesState.customers.map((item) => `<option value="${item.id}">${escapeHtml(item.customer_code)} · ${escapeHtml(item.legal_name)}</option>`).join('');
   const orderOptions = salesState.orders.map((item) => `<option value="${item.id}">${escapeHtml(item.order_number)} · ${escapeHtml(item.customer_name)}</option>`).join('');
   const invoiceOptions = salesState.invoices.filter((item) => ['Issued', 'Overdue'].includes(item.status)).map((item) => `<option value="${item.id}">${escapeHtml(item.invoice_number)} · ${escapeHtml(item.customer_name)} · ${formatCurrency(Number(item.total))}</option>`).join('');
@@ -950,6 +1241,9 @@ function renderSales() {
     .filter((item) => item.entity_type === 'customer' && ['customer_credit_hold_placed', 'customer_credit_hold_released'].includes(item.action))
     .map((item) => `<tr><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.action === 'customer_credit_hold_placed' ? 'Hold placed' : 'Hold released')}</td><td>${escapeHtml(salesState.customers.find((customer) => customer.id === item.entity_id)?.legal_name || item.entity_id)}</td><td>${escapeHtml(item.changes?.reason || '')}</td><td>${escapeHtml(item.user_id || '')}</td></tr>`).join('');
   const creditHoldCount = salesState.customers.filter((customer) => customer.credit_hold).length;
+  const crmRows = salesState.crmRecords.map((item) => `<tr><td>${escapeHtml(item.record_type)}</td><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.customer_name || item.contact_name || '—')}</td><td>${escapeHtml(item.stage)}</td><td>${formatCurrency(Number(item.estimated_value || 0))}</td><td>${item.expected_close_date ? escapeHtml(String(item.expected_close_date).slice(0, 10)) : '—'}</td></tr>`).join('');
+  const activityRows = salesState.activities.map((item) => `<tr><td>${escapeHtml(String(item.activity_date).slice(0, 16).replace('T', ' '))}</td><td>${escapeHtml(item.customer_name || item.crm_record_name || '—')}</td><td>${escapeHtml(item.activity_type)}</td><td>${escapeHtml(item.subject)}</td><td>${escapeHtml(item.details || '')}</td><td>${item.next_follow_up ? escapeHtml(String(item.next_follow_up).slice(0, 10)) : '—'}</td></tr>`).join('');
+  const disputeRows = salesState.disputes.map((item) => `<tr><td>${escapeHtml(item.invoice_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${formatCurrency(Number(item.outstanding))}</td><td>${escapeHtml(item.reason)}</td><td>${renderStatus(item.status)}</td><td>${escapeHtml(item.resolution || '')}</td><td>${item.status === 'OPEN' ? action(item.id, 'dispute-review', 'Review', 'sales:customers:manage') + action(item.id, 'dispute-resolve', 'Resolve', 'sales:customers:manage') : ''}</td></tr>`).join('');
   const creditHoldRows = salesState.customers.map((customer) => {
     const status = customer.credit_hold
       ? `<span class="credit-hold-status held">On hold</span>`
@@ -966,13 +1260,14 @@ function renderSales() {
   const reportRows = (rows, firstField) => (rows || []).map((item) => `<tr><td>${escapeHtml(item[firstField] || 'Unassigned')}</td><td>${formatCurrency(Number(item.sales || 0))}</td></tr>`).join('');
   const contents = {
     overview: `<div class="sales-summary"><div><span>Customers</span><strong>${salesState.customers.length}</strong></div><div><span>Customers on credit hold</span><strong>${creditHoldCount}</strong></div><div><span>Quotations</span><strong>${salesState.quotations.length}</strong></div><div><span>Open orders</span><strong>${salesState.orders.filter((item) => !['Rejected', 'Cancelled'].includes(item.status)).length}</strong></div><div><span>Receivables</span><strong>${formatCurrency(Number(reports.receivables?.receivables || 0))}</strong></div></div><h3>Existing sales orders</h3>${table(['Order', 'Customer', 'Date', 'Status', 'Amount', 'Actions'], legacyRows)}`,
+    crm: `${form('crm', 'Add lead or opportunity', `<label>Record type<select name="recordType"><option value="LEAD">Lead</option><option value="OPPORTUNITY">Opportunity</option></select></label>${field('Name / opportunity', 'name')}${field('Contact name', 'contactName', 'text', false)}<label>Existing customer<select name="customerId"><option value="">Not linked yet</option>${customerOptions}</select></label>${field('Email', 'email', 'email', false)}${field('Phone', 'phone', 'tel', false)}${field('Source', 'source', 'text', false)}<label>Stage<select name="stage"><option value="NEW">New</option><option value="QUALIFIED">Qualified</option><option value="PROPOSAL">Proposal</option><option value="NEGOTIATION">Negotiation</option></select></label>${field('Estimated value', 'estimatedValue', 'number', false)}${field('Expected close', 'expectedCloseDate', 'date', false)}${field('Notes', 'notes', 'text', false)}`, 'sales:customers:manage')}${form('activity', 'Log customer activity', `<label>Customer<select name="customerId"><option value="">Use lead/opportunity instead</option>${customerOptions}</select></label><label>Lead / opportunity<select name="crmRecordId"><option value="">Select if no customer</option>${salesState.crmRecords.map((record) => `<option value="${record.id}">${escapeHtml(record.record_type)} · ${escapeHtml(record.name)}</option>`).join('')}</select></label><label>Activity type<select name="activityType"><option value="CALL">Call</option><option value="EMAIL">Email</option><option value="MEETING">Meeting</option><option value="NOTE">Note</option><option value="FOLLOW_UP">Follow-up</option></select></label>${field('Subject', 'subject')}${field('Details', 'details', 'text', false)}${field('Next follow-up', 'nextFollowUp', 'date', false)}`, 'sales:customers:manage')}<h3>Leads and opportunities</h3>${table(['Type','Name','Customer / contact','Stage','Estimated value','Expected close'],crmRows)}<h3>Customer activity timeline</h3>${table(['Date','Customer / lead','Type','Subject','Details','Follow-up'],activityRows)}`,
     customers: `${form('customer', 'Add customer', `${field('Customer code', 'customerCode')}${field('Legal name', 'legalName')}${field('Contact person', 'contactPerson')}${field('Phone', 'phone', 'tel', false)}${field('Email', 'email', 'email', false)}${field('Tax ID', 'taxId', 'text', false)}${field('Credit limit', 'creditLimit', 'number', false)}${field('Payment terms', 'paymentTerms', 'text', false, 'value="30 days"')}${field('Currency', 'currency', 'text', false, 'value="ETB"')}${field('Billing address', 'billingAddress', 'text', false)}${field('Shipping address', 'shippingAddress', 'text', false)}${field('Delivery address', 'deliveryAddress', 'text', false)}`, 'sales:customers:create')}<h3>Customer register</h3>${table(['Code', 'Legal name', 'Contact', 'Phone', 'Email', 'Credit limit', 'Status', 'Credit hold', 'Actions'], customerRows)}`,
     quotations: `${form('quotation', 'New quotation', `<label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Valid through', 'validityDate', 'date')}${field('Discount %', 'discountPercent', 'number', false)}<label>Product lines (JSON)<textarea name="lines" rows="5" required>${escapeHtml(lineJson)}</textarea></label>${field('Terms', 'terms', 'text', false)}`, 'sales:quotations:create')}<h3>Quotation pipeline</h3>${table(['Quotation', 'Customer', 'Valid through', 'Status', 'Total', 'Workflow'], quotationRows)}`,
     orders: `${form('order', 'Create sales order', `<label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Delivery date', 'deliveryDate', 'date', false)}${field('Payment terms', 'paymentTerms', 'text', false)}${field('Discount %', 'discountPercent', 'number', false)}<label>Product lines (JSON)<textarea name="lines" rows="5" required>${escapeHtml(lineJson)}</textarea></label>`, 'sales:orders:create')}<div class="sales-order-list-header"><div><h3>Sales order register</h3><p>Approved orders remain in this list alongside drafts and orders awaiting review.</p></div><button type="button" class="secondary-btn" data-sales-orders-refresh>Refresh list</button></div><div class="sales-order-tools"><div class="sales-order-filters" role="group" aria-label="Filter sales orders by status">${orderFilterButtons}</div><form class="sales-order-search" data-sales-order-search-form><label for="sales-order-search">Search orders</label><div><input id="sales-order-search" name="search" type="search" placeholder="Order number or customer" value="${escapeHtml(salesState.orderSearch)}" /><button type="submit" class="small-action">Search</button><button type="button" class="small-action" data-sales-order-clear>Clear</button></div></form></div>${table(['Order', 'Customer', 'Delivery date', 'Status', 'Approval', 'Total', 'Workflow'], orderRows || `<tr><td colspan="7" class="empty-state">${orderEmptyState}</td></tr>`, 'sales-order-register')}`,
     deliveries: `${form('delivery', 'Create delivery note', `<label>Approved order<select name="orderId" required>${orderOptions}</select></label><label>Warehouse<select name="warehouseId" required>${salesState.warehouses.map((item) => `<option value="${item.id}">${escapeHtml(item.code)} · ${escapeHtml(item.name)}</option>`).join('')}</select></label>${field('Delivery date', 'deliveryDate', 'date', false)}${field('Carrier', 'carrier', 'text', false)}${field('Tracking number', 'trackingNumber', 'text', false)}`, 'sales:delivery:create')}<h3>Picking, packing and shipment</h3>${table(['Delivery note', 'Order', 'Customer', 'Warehouse', 'Status', 'Next step'], deliveryRows)}`,
     invoices: `${form('invoice', 'Create customer invoice', `<label>Approved order<select name="orderId" required>${orderOptions}</select></label>${field('Invoice date', 'invoiceDate', 'date', false)}${field('Due date', 'dueDate', 'date')}`, 'sales:invoices:create')}<h3>Customer invoices</h3>${table(['Invoice', 'Customer', 'Invoice date', 'Due date', 'Status', 'Total', 'Posting'], invoiceRows)}`,
     payments: `${form('payment', 'Record customer payment', `<label>Issued invoice<select name="invoiceId" required>${invoiceOptions}</select></label><label>Method<select name="paymentMethod" required><option value="cash">Cash</option><option value="bank">Bank</option><option value="transfer">Transfer</option><option value="cheque">Cheque</option><option value="other">Other</option></select></label>${field('Amount', 'amount', 'number')}${field('Payment date', 'paymentDate', 'date', false)}${field('Reference / cheque number', 'referenceNumber', 'text', false)}`, 'sales:payments:create')}<h3>Receipts</h3>${table(['Receipt', 'Invoice', 'Customer', 'Method', 'Date', 'Amount', 'Reference'], paymentRows)}`,
-    receivables: `<h3>Accounts receivable aging</h3>${table(['Invoice', 'Customer', 'Due date', 'Invoice total', 'Paid', 'Outstanding', 'Aging', 'Status'], receivableRows)}`,
+    receivables: `<h3>Accounts receivable aging</h3>${table(['Invoice', 'Customer', 'Due date', 'Invoice total', 'Paid', 'Outstanding', 'Aging', 'Status'], receivableRows)}${form('dispute', 'Open receivable dispute', `<label>Open receivable<select name="receivableId" required>${salesState.receivables.filter((item) => Number(item.outstanding) > 0).map((item) => `<option value="${item.id}">${escapeHtml(item.invoice_number)} · ${escapeHtml(item.customer_name)} · ${formatCurrency(Number(item.outstanding))}</option>`).join('')}</select></label>${field('Reason', 'reason')}`, 'sales:customers:manage')}<h3>Dispute management</h3>${table(['Invoice','Customer','Outstanding','Reason','Status','Resolution','Action'],disputeRows)}`,
     creditHolds: `<p>Orders are blocked when a customer is on hold or the order would exceed the approved credit limit.</p><h3>Customer credit status</h3>${table(['Code', 'Customer', 'Credit status', 'Reason', 'Approved limit', 'Actions'], creditHoldRows)}<h3>Credit hold history</h3>${table(['Date', 'Action', 'Customer', 'Reason', 'Authorized by'], creditHistoryRows)}`,
     creditHistory: `<h3>Customer credit hold history</h3>${table(['Date', 'Action', 'Customer', 'Reason', 'Authorized by'], creditHistoryRows)}`,
     reports: `<div class="sales-summary"><div><span>Gross sales</span><strong>${formatCurrency(Number(reports.summary?.gross_sales || 0))}</strong></div><div><span>Discounts</span><strong>${formatCurrency(Number(reports.summary?.discounts || 0))}</strong></div><div><span>VAT</span><strong>${formatCurrency(Number(reports.summary?.vat || 0))}</strong></div><div><span>Net sales</span><strong>${formatCurrency(Number(reports.summary?.net_sales || 0))}</strong></div></div><div class="sales-report-grid"><section><h3>By customer</h3>${table(['Customer', 'Sales'], reportRows(reports.byCustomer, 'legal_name'))}</section><section><h3>By product</h3>${table(['Product', 'Sales'], reportRows(reports.byProduct, 'product_name'))}</section><section><h3>By salesperson</h3>${table(['Salesperson', 'Sales'], reportRows(reports.bySalesperson, 'salesperson'))}</section><section><h3>By period</h3>${table(['Period', 'Sales'], reportRows(reports.byPeriod, 'period'))}</section></div>`,
@@ -985,7 +1280,8 @@ function renderInventory() {
   const receiveAction = hasRolePermission(actionPermissions.inventory)
     ? `<button class="primary-btn" type="button" data-action-form="inventory">Receive stock</button>`
     : '';
-  const activeTab = ['transfers', 'counts'].includes(inventoryTransferState.tab) ? inventoryTransferState.tab : 'overview';
+  const activeTab = ['transfers', 'counts', 'traceability'].includes(inventoryTransferState.tab)
+    ? inventoryTransferState.tab : 'overview';
   const pendingTransferCount = inventoryTransferState.transfers.filter((transfer) => transfer.status === 'REQUESTED').length;
   const inventoryOverview = `
     ${hasRolePermission('inventory:reports:view') ? `
@@ -1192,6 +1488,111 @@ function renderInventory() {
       <tbody>${countRows || `<tr><td colspan="5" class="empty-state"><strong>${inventoryTransferState.counts.length ? 'No counts match this status.' : 'No stock counts yet.'}</strong><span>${inventoryTransferState.counts.length ? 'Choose another status to see more counts.' : 'Start a physical count above to record and review stock variances.'}</span></td></tr>`}</tbody>
     </table></div>
   </section>`;
+  const traceLotRows = inventoryTransferState.traceLots.map((lot) => {
+    const actions = hasRolePermission('inventory:adjustments:approve')
+      ? `<div class="inventory-trace-actions">${(lot.quality_status === 'AVAILABLE'
+        ? [['QUARANTINED', 'Quarantine'], ['DAMAGED', 'Mark damaged'], ['RETURNED', 'Mark returned']]
+        : [['AVAILABLE', 'Release to available']])
+        .map(([status, label]) => `<button class="small-action" type="button" data-lot-quality="${status}" data-lot-id="${lot.id}">${label}</button>`).join('')}</div>`
+      : '—';
+    const expiry = lot.expiry_date ? String(lot.expiry_date).slice(0, 10) : '—';
+    return `<tr><td><strong>${escapeHtml(lot.lot_number)}</strong><small>${escapeHtml(lot.barcode || 'No lot barcode')}</small></td>
+      <td>${escapeHtml(lot.product_sku)}<small>${escapeHtml(lot.product_name)}</small></td>
+      <td>${escapeHtml(lot.warehouse_code || '—')}<small>${escapeHtml(lot.location_code || 'No bin recorded')}${lot.bin_code ? ` · ${escapeHtml(lot.bin_code)}` : ''}</small></td>
+      <td>${Number(lot.remaining_quantity)} ${escapeHtml(lot.unit_of_measure_code || '')}</td>
+      <td>${escapeHtml(expiry)}${lot.expired ? '<small class="negative-number">Expired</small>' : ''}</td>
+      <td>${escapeHtml(lot.warranty_end_date ? String(lot.warranty_end_date).slice(0, 10) : '—')}</td>
+      <td><span class="transfer-status ${escapeHtml(lot.quality_status.toLowerCase())}">${escapeHtml(lot.quality_status)}</span></td>
+      <td><div data-qr-label-container><button class="small-action" type="button" data-qr-label data-qr-code="${escapeHtml(lot.barcode || lot.lot_number)}">QR label</button></div>${actions}</td></tr>`;
+  }).join('');
+  const traceSerialRows = inventoryTransferState.serialNumbers.map((serial) => `<tr>
+    <td><strong>${escapeHtml(serial.serial_number)}</strong></td>
+    <td>${escapeHtml(serial.product_sku)}<small>${escapeHtml(serial.product_name)}</small></td>
+    <td>${serial.status === 'IN_TRANSIT' ? 'In transit' : escapeHtml(serial.warehouse_code || '—')}
+      <small>${escapeHtml(serial.location_code || (serial.status === 'IN_TRANSIT' ? 'Between warehouses' : 'No bin recorded'))}${serial.bin_code ? ` · ${escapeHtml(serial.bin_code)}` : ''}</small></td>
+    <td>${escapeHtml(serial.lot_number)}</td>
+    <td><span class="transfer-status ${escapeHtml(serial.status.toLowerCase())}">${escapeHtml(serial.status)}</span></td>
+    <td>${escapeHtml(serial.warranty_end_date ? String(serial.warranty_end_date).slice(0, 10) : '—')}</td>
+    <td><div data-qr-label-container><button class="small-action" type="button" data-qr-label data-qr-code="${escapeHtml(serial.barcode || serial.serial_number)}">QR label</button></div></td>
+  </tr>`).join('');
+  const reservationRows = inventoryTransferState.reservations.map((reservation) => `<tr>
+    <td><strong>${escapeHtml(reservation.product_sku)}</strong><small>${escapeHtml(reservation.product_name)}</small></td>
+    <td>${escapeHtml(reservation.warehouse_code)}</td>
+    <td>${Number(reservation.quantity) - Number(reservation.fulfilled_quantity)} / ${Number(reservation.quantity)} ${escapeHtml(reservation.unit_of_measure_code)}</td>
+    <td>${escapeHtml(reservation.reference_type || '—')}${reservation.reference_id ? `<small>${escapeHtml(reservation.reference_id)}</small>` : ''}</td>
+    <td><span class="transfer-status ${escapeHtml(reservation.status.toLowerCase())}">${escapeHtml(reservation.status)}</span></td>
+    <td>${reservation.status === 'ACTIVE' && hasRolePermission('inventory:stock:update')
+      ? `<button class="small-action" type="button" data-reservation-release="${reservation.id}">Release</button>` : '—'}</td>
+  </tr>`).join('');
+  const traceProductOptions = inventoryTransferState.products.map((product) => (
+    `<option value="${product.id}">${escapeHtml(product.sku)} · ${escapeHtml(product.name)}</option>`
+  )).join('');
+  const traceWarehouseOptions = inventoryTransferState.warehouses.map((warehouse) => (
+    `<option value="${warehouse.id}">${escapeHtml(warehouse.code)} · ${escapeHtml(warehouse.name)}</option>`
+  )).join('');
+  const traceLocationOptions = inventoryTransferState.locations.map((location) => (
+    `<option value="${location.id}" data-warehouse-id="${location.warehouse_id}">${escapeHtml(location.code)} · ${escapeHtml(location.name)}${location.bin_code ? ` (${escapeHtml(location.bin_code)})` : ''}</option>`
+  )).join('');
+  const traceReceiveForm = hasRolePermission('inventory:stock:update') ? `<form class="inventory-trace-form" data-inventory-trace-receive>
+    <h4>Receive lot-tracked stock</h4>
+    <label>Product<select name="productId" required>${traceProductOptions}</select></label>
+    <label>Warehouse<select name="warehouseId" data-trace-warehouse required>${traceWarehouseOptions}</select></label>
+    <label>Location / bin<select name="locationId" data-trace-location><option value="">No specific location</option>${traceLocationOptions}</select></label>
+    <label>Quantity<input name="quantity" type="number" min="0.000001" step="0.000001" required /></label>
+    <label>Unit cost<input name="unitCost" type="number" min="0" step="0.000001" value="0" required /></label>
+    <label>Lot / batch number<input name="lotNumber" maxlength="100" required /></label>
+    <label>Lot barcode / QR data<input name="lotBarcode" maxlength="128" /></label>
+    <label>Expiry date<input name="expiryDate" type="date" /></label>
+    <label>Warranty end date<input name="warrantyEndDate" type="date" /></label>
+    <label>Quality status<select name="qualityStatus"><option value="AVAILABLE">Available</option><option value="QUARANTINED">Quarantined</option><option value="RETURNED">Returned - quarantine</option></select></label>
+    <label class="inventory-trace-wide">Serial numbers <span>Enter one per unit, separated by line breaks or commas.</span><textarea name="serialNumbers" rows="2"></textarea></label>
+    <label>Reference type<input name="referenceType" value="PURCHASE_RECEIPT" /></label>
+    <label>Reference<input name="referenceId" required /></label>
+    <span class="inventory-trace-error" role="alert"></span><button class="primary-btn" type="submit">Receive tracked stock</button>
+  </form>` : '';
+  const reservationForm = hasRolePermission('inventory:stock:update') ? `<form class="inventory-trace-form" data-inventory-reservation>
+    <h4>Reserve stock for an order</h4>
+    <label>Product<select name="productId" required>${traceProductOptions}</select></label>
+    <label>Warehouse<select name="warehouseId" data-trace-warehouse required>${traceWarehouseOptions}</select></label>
+    <label>Location / bin<select name="locationId" data-trace-location><option value="">Any location</option>${traceLocationOptions}</select></label>
+    <label>Quantity<input name="quantity" type="number" min="0.000001" step="0.000001" required /></label>
+    <label>Order type<input name="referenceType" maxlength="60" placeholder="SALES_ORDER" /></label>
+    <label>Order reference<input name="referenceId" maxlength="128" /></label>
+    <label class="inventory-trace-wide">Reason<input name="reason" /></label>
+    <span class="inventory-trace-error" role="alert"></span><button class="primary-btn" type="submit">Reserve stock</button>
+  </form>` : '';
+  const trackedIssueForm = hasRolePermission('inventory:stock:issue') ? `<form class="inventory-trace-form" data-inventory-tracked-issue>
+    <h4>Issue reserved or serial-tracked stock</h4>
+    <label>Product<select name="productId" required>${traceProductOptions}</select></label>
+    <label>Warehouse<select name="warehouseId" data-trace-warehouse required>${traceWarehouseOptions}</select></label>
+    <label>Location / bin<select name="locationId" data-trace-location><option value="">Any location</option>${traceLocationOptions}</select></label>
+    <label>Quantity<input name="quantity" type="number" min="0.000001" step="0.000001" required /></label>
+    <label>Reservation<select name="reservationId"><option value="">Use unreserved stock</option>${inventoryTransferState.reservations.filter((item) => item.status === 'ACTIVE').map((item) => `<option value="${item.id}">${escapeHtml(item.product_sku)} · ${escapeHtml(item.warehouse_code)} · ${Number(item.quantity) - Number(item.fulfilled_quantity)} available</option>`).join('')}</select></label>
+    <label>Reference type<input name="referenceType" value="MANUAL_ISSUE" /></label>
+    <label>Reference<input name="referenceId" required /></label>
+    <label class="inventory-trace-wide">Serial numbers <span>Required for serial-tracked stock; one per unit.</span><textarea name="serialNumbers" rows="2"></textarea></label>
+    <span class="inventory-trace-error" role="alert"></span><button class="primary-btn" type="submit">Issue stock</button>
+  </form>` : '';
+  const traceLookupResult = inventoryTransferState.traceLookup
+    ? `<div class="inventory-trace-lookup-result"><strong>${escapeHtml(inventoryTransferState.traceLookup.type)} found</strong>
+      <span>${escapeHtml(inventoryTransferState.traceLookup.sku || inventoryTransferState.traceLookup.product_sku || inventoryTransferState.traceLookup.lot_number || inventoryTransferState.traceLookup.serial_number)}</span>
+      <span>${escapeHtml(inventoryTransferState.traceLookup.name || inventoryTransferState.traceLookup.product_name || inventoryTransferState.traceLookup.quality_status || inventoryTransferState.traceLookup.status || '')}</span></div>`
+    : '';
+  const traceabilityContent = `<section class="inventory-trace-workspace">
+    <div class="inventory-transfer-heading"><div><h3>Traceability, reservations &amp; quality</h3><p>Track lots, serials, expiry and warranty; scan barcodes or QR data; keep reserved and quarantined stock out of general issues.</p></div></div>
+    ${inventoryTransferState.error ? `<p class="inventory-transfer-message" role="alert">${escapeHtml(inventoryTransferState.error)}</p>` : ''}
+    <form class="inventory-trace-scan" data-inventory-trace-lookup><label>Scan or enter product, lot, serial, barcode, or QR data<input name="code" autocomplete="off" required autofocus /></label><button class="primary-btn" type="submit">Look up</button><span class="inventory-trace-error" role="alert">${escapeHtml(inventoryTransferState.traceLookupError)}</span>${traceLookupResult}</form>
+    <div class="inventory-trace-forms">${traceReceiveForm}${reservationForm}${trackedIssueForm}</div>
+    <h4>Lot and batch register</h4>
+    <div class="table-wrap inventory-transfer-table-wrap"><table class="inventory-transfer-table"><thead><tr><th>Lot / barcode</th><th>Product</th><th>Warehouse / bin</th><th>Remaining</th><th>Expiry</th><th>Warranty</th><th>Quality</th><th>Disposition / QR</th></tr></thead>
+      <tbody>${traceLotRows || '<tr><td colspan="8" class="empty-state"><strong>No traced lots yet.</strong><span>Receive stock with a lot number to capture expiry, warranty, barcode, and quality information.</span></td></tr>'}</tbody></table></div>
+    <h4>Serial register</h4>
+    <div class="table-wrap inventory-transfer-table-wrap"><table class="inventory-transfer-table"><thead><tr><th>Serial</th><th>Product</th><th>Warehouse</th><th>Lot</th><th>Status</th><th>Warranty</th><th>QR</th></tr></thead>
+      <tbody>${traceSerialRows || '<tr><td colspan="7" class="empty-state"><strong>No serial-tracked stock yet.</strong><span>Add serial numbers when receiving a lot of whole-unit products.</span></td></tr>'}</tbody></table></div>
+    <h4>Reservations</h4>
+    <div class="table-wrap inventory-transfer-table-wrap"><table class="inventory-transfer-table"><thead><tr><th>Product</th><th>Warehouse</th><th>Remaining / reserved</th><th>Order reference</th><th>Status</th><th>Action</th></tr></thead>
+      <tbody>${reservationRows || '<tr><td colspan="6" class="empty-state"><strong>No stock reservations yet.</strong><span>Reserve available stock against a sales or production order.</span></td></tr>'}</tbody></table></div>
+  </section>`;
 
   return `
     <section class="content-panel inventory-workspace">
@@ -1206,14 +1607,15 @@ function renderInventory() {
         <button type="button" data-inventory-tab="overview" class="${activeTab === 'overview' ? 'active' : ''}">Overview</button>
         <button type="button" data-inventory-tab="transfers" class="${activeTab === 'transfers' ? 'active' : ''}">Stock transfers</button>
         ${hasRolePermission('inventory:reports:view') ? `<button type="button" data-inventory-tab="counts" class="${activeTab === 'counts' ? 'active' : ''}">Stock counts</button>` : ''}
+        ${hasRolePermission('inventory:reports:view') ? `<button type="button" data-inventory-tab="traceability" class="${activeTab === 'traceability' ? 'active' : ''}">Traceability &amp; reservations</button>` : ''}
       </nav>
-      ${activeTab === 'transfers' ? transferContent : activeTab === 'counts' ? countContent : inventoryOverview}
+      ${activeTab === 'transfers' ? transferContent : activeTab === 'counts' ? countContent : activeTab === 'traceability' ? traceabilityContent : inventoryOverview}
     </section>
   `;
 }
 
 function renderProcurement() {
-  const tabs = [['comparisons', 'Quote comparisons'], ['suppliers', 'Suppliers'], ['orders', 'Purchase orders']];
+  const tabs = [['comparisons', 'Quote comparisons'], ['suppliers', 'Suppliers'], ['requisitions', 'Requisitions'], ['orders', 'Purchase orders'], ['matching', 'Invoice matching']];
   const showStatus = (status) => {
     const label = String(status || '').toLowerCase().split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
     return renderStatus(label);
@@ -1229,8 +1631,10 @@ function renderProcurement() {
   const supplierForm = canManageSuppliers ? `<details class="procurement-disclosure"><summary>+ Add supplier</summary><form class="procurement-form-grid" data-procurement-supplier-form>
     <label>Supplier name<input name="name" maxlength="180" required placeholder="e.g. Northstar Industrial" /></label>
     <label>Supplier code<input name="supplierCode" maxlength="60" required placeholder="e.g. SUP-014" /></label>
-    <label>Contact person<input name="contactName" /></label><label>Email<input name="email" type="email" /></label>
-    <label>Phone<input name="phone" /></label><label>Default payment terms<input name="paymentTerms" placeholder="Net 30" /></label>
+    <label>Contact person<input name="contactName" maxlength="100" data-input-rule="person" title="Use letters, spaces, apostrophes, periods, or hyphens." /></label><label>Email<input name="email" type="email" /></label>
+    <label>Phone<input name="phone" type="tel" inputmode="tel" pattern="[+0-9(). -]{7,24}" maxlength="24" title="Use 7-15 digits; standard phone punctuation is allowed." /></label><label>Default payment terms<input name="paymentTerms" placeholder="Net 30" /></label>
+    <label>Qualification<select name="qualificationStatus"><option value="PENDING">Pending qualification</option><option value="QUALIFIED">Qualified</option><option value="SUSPENDED">Suspended</option></select></label>
+    <label>Risk level<select name="riskLevel"><option value="LOW">Low risk</option><option value="MEDIUM" selected>Medium risk</option><option value="HIGH">High risk</option></select></label>
     <label class="procurement-span">Notes<input name="notes" /></label>
     <button class="primary-btn" type="submit">Save supplier</button><span class="procurement-form-error" role="alert"></span>
   </form></details>` : '';
@@ -1266,7 +1670,7 @@ function renderProcurement() {
   const supplierContent = `<div class="procurement-section-heading"><div><h3>Supplier directory</h3><p>Maintain the suppliers used across purchasing comparisons.</p></div><span class="procurement-count">${procurementState.suppliers.length} active</span></div>
     ${supplierForm}
     <div class="procurement-supplier-grid">${procurementState.suppliers.length ? procurementState.suppliers.map((supplier) => `<article class="procurement-supplier-card">
-      <div class="procurement-supplier-avatar">${escapeHtml(String(supplier.name).slice(0, 1).toUpperCase())}</div><div class="procurement-supplier-info"><strong>${escapeHtml(supplier.name)}</strong><span>${escapeHtml(supplier.supplier_code)}</span></div>
+      <div class="procurement-supplier-avatar">${escapeHtml(String(supplier.name).slice(0, 1).toUpperCase())}</div><div class="procurement-supplier-info"><strong>${escapeHtml(supplier.name)}</strong><span>${escapeHtml(supplier.supplier_code)} · ${escapeHtml(supplier.qualification_status || 'PENDING')} · ${escapeHtml(supplier.risk_level || 'MEDIUM')} risk</span></div>
       <div class="procurement-supplier-meta">${supplier.contact_name ? `<span>${escapeHtml(supplier.contact_name)}</span>` : ''}${supplier.email ? `<a href="mailto:${escapeHtml(supplier.email)}">${escapeHtml(supplier.email)}</a>` : ''}${supplier.phone ? `<span>${escapeHtml(supplier.phone)}</span>` : ''}<span>${escapeHtml(supplier.payment_terms || 'Payment terms set per quotation')}</span></div>
     </article>`).join('') : `<div class="procurement-empty-state"><strong>No suppliers added yet</strong><span>Add suppliers here, then enter at least two quotations to compare.</span></div>`}</div>`;
   const comparisonContent = `<div class="procurement-section-heading"><div><h3>Supplier quotations</h3><p>Review price, tax, delivery, terms and landed cost side by side.</p></div><span class="procurement-count">${openCount} open</span></div>
@@ -1315,7 +1719,13 @@ function renderProcurement() {
   const legacyOrders = applicationData.purchaseOrders.map((order) => `<tr><td><strong>${escapeHtml(order.po)}</strong><span class="procurement-table-sub">Legacy purchase order</span></td><td>${escapeHtml(order.vendor)}</td><td>${escapeHtml(order.eta)}</td><td>${renderStatus(order.status)}</td><td>—</td><td>${formatCurrency(Number(order.amount))}</td><td>${recordActions('procurement', order.po, order.vendor)}</td></tr>`).join('');
   const ordersContent = `<div class="procurement-section-heading"><div><h3>Purchase orders</h3><p>Review selected supplier orders, approvals and receipts.</p></div><span class="procurement-count">${waitingCount} awaiting approval</span></div>
     ${procurementState.orders.length || applicationData.purchaseOrders.length ? `<div class="table-wrap procurement-orders-wrap"><table><thead><tr><th>PO / comparison</th><th>Supplier</th><th>Expected</th><th>Status</th><th>Received</th><th>Total</th><th>Actions / history</th></tr></thead><tbody>${dbOrders}${legacyOrders}</tbody></table></div>` : `<div class="procurement-empty-state"><strong>No purchase orders yet</strong><span>Select a supplier from a saved comparison to generate a purchase order.</span></div>`}`;
-  const tabContent = active === 'suppliers' ? supplierContent : active === 'orders' ? ordersContent : comparisonContent;
+  const requisitionRows = procurementState.requisitions.map((item) => `<tr><td>${escapeHtml(item.requisition_number)}</td><td>${escapeHtml(item.title)}<small>${escapeHtml(item.description)}</small></td><td>${Number(item.quantity)}</td><td>${formatCurrency(Number(item.estimated_unit_cost))}</td><td>${formatCurrency(Number(item.budget_limit))}</td><td>${showStatus(item.status)}</td><td>${item.status === 'SUBMITTED' && hasRolePermission('procurement:orders:approve') ? `<button class="small-action" type="button" data-procurement-controlled-action="requisition-approve" data-id="${item.id}">Approve</button><button class="small-action danger-btn" type="button" data-procurement-controlled-action="requisition-reject" data-id="${item.id}">Reject</button>` : escapeHtml(item.decision_reason || '—')}</td></tr>`).join('');
+  const requisitionContent = `${hasRolePermission('procurement:orders:create') ? `<details class="procurement-disclosure"><summary>+ Create purchase requisition</summary><form class="procurement-form-grid" data-procurement-control="requisition"><label>Title<input name="title" required maxlength="180" /></label><label>Quantity<input name="quantity" type="number" min="0.001" step="0.001" required /></label><label>Estimated unit cost<input name="estimatedUnitCost" type="number" min="0" step="0.01" required /></label><label>Budget limit<input name="budgetLimit" type="number" min="0" step="0.01" required /></label><label class="procurement-span">Description<textarea name="description" required></textarea></label><button class="primary-btn" type="submit">Submit requisition</button><span class="procurement-form-error" role="alert"></span></form></details>` : ''}<h3>Purchase requisitions · budget validation</h3><div class="table-wrap"><table><thead><tr><th>Requisition</th><th>Request</th><th>Qty</th><th>Est. unit cost</th><th>Budget</th><th>Status</th><th>Decision</th></tr></thead><tbody>${requisitionRows || '<tr><td colspan="7" class="empty-state">No requisitions yet.</td></tr>'}</tbody></table></div>`;
+  const invoiceOptions = procurementState.orders.filter((order) => ['APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(order.status)).map((order) => `<option value="${order.id}">${escapeHtml(order.po_number)} · ${escapeHtml(order.supplier_name)} · received ${Number(order.received_quantity)} / ${Number(order.ordered_quantity)}</option>`).join('');
+  const invoiceRows = procurementState.supplierInvoices.map((invoice) => `<tr><td>${escapeHtml(invoice.supplier_invoice_number)}</td><td>${escapeHtml(invoice.po_number)}</td><td>${escapeHtml(invoice.supplier_name)}</td><td>${Number(invoice.invoice_quantity)} / ${Number(invoice.ordered_quantity)}</td><td>${formatCurrency(Number(invoice.invoice_amount))} / ${formatCurrency(Number(invoice.po_total))}</td><td>${showStatus(invoice.status)}</td><td>${escapeHtml(invoice.match_notes || '—')}</td><td>${invoice.status !== 'MATCHED' && invoice.status !== 'PAID' && hasRolePermission('procurement:orders:approve') ? `<button class="small-action" type="button" data-procurement-controlled-action="invoice-match" data-id="${invoice.id}">Run 3-way match</button>` : ''}</td></tr>`).join('');
+  const scorecardRows = procurementState.scorecards.map((supplier) => `<tr><td>${escapeHtml(supplier.name)}</td><td>${escapeHtml(supplier.qualification_status)}</td><td>${escapeHtml(supplier.risk_level)}</td><td>${Number(supplier.order_count)}</td><td>${Number(supplier.completed_orders)}</td><td>${Number(supplier.on_time_score).toFixed(0)}%</td><td>${formatCurrency(Number(supplier.spend))}</td></tr>`).join('');
+  const matchingContent = `${hasRolePermission('procurement:orders:receive') ? `<details class="procurement-disclosure"><summary>+ Register supplier invoice</summary><form class="procurement-form-grid" data-procurement-control="supplierInvoice"><label>Purchase order<select name="purchaseOrderId" required>${invoiceOptions}</select></label><label>Supplier invoice number<input name="supplierInvoiceNumber" required /></label><label>Invoice quantity<input name="invoiceQuantity" type="number" min="0.001" step="0.001" required /></label><label>Invoice amount<input name="invoiceAmount" type="number" min="0" step="0.01" required /></label><label>Invoice date<input name="invoiceDate" type="date" value="${new Date().toISOString().slice(0,10)}" required /></label><button class="primary-btn" type="submit">Register invoice</button><span class="procurement-form-error" role="alert"></span></form></details>` : ''}<h3>Three-way PO · receipt · invoice matching</h3><div class="table-wrap"><table><thead><tr><th>Supplier invoice</th><th>PO</th><th>Supplier</th><th>Invoice / ordered qty</th><th>Invoice / PO amount</th><th>Match status</th><th>Exception</th><th>Action</th></tr></thead><tbody>${invoiceRows || '<tr><td colspan="8" class="empty-state">No supplier invoices to match.</td></tr>'}</tbody></table></div><h3>Supplier scorecards and concentration</h3><div class="table-wrap"><table><thead><tr><th>Supplier</th><th>Qualification</th><th>Risk</th><th>Orders</th><th>Received</th><th>Delivery score</th><th>Total spend</th></tr></thead><tbody>${scorecardRows || '<tr><td colspan="7" class="empty-state">No supplier spend recorded.</td></tr>'}</tbody></table></div>`;
+  const tabContent = active === 'suppliers' ? supplierContent : active === 'orders' ? ordersContent : active === 'requisitions' ? requisitionContent : active === 'matching' ? matchingContent : comparisonContent;
   return `<section class="content-panel procurement-workspace">
     <div class="procurement-hero"><div class="procurement-hero-copy"><p class="eyebrow">Sourcing workspace</p><h2>Make every supplier decision with confidence.</h2><p>Compare complete landed costs, delivery commitments and payment terms before converting the winning quote into a purchase order.</p>
       <div class="procurement-hero-actions"><button type="button" class="primary-btn" data-procurement-tab="comparisons">Compare quotations</button><button type="button" class="procurement-hero-link" data-procurement-tab="suppliers">Manage suppliers <span aria-hidden="true">→</span></button></div>
@@ -1374,10 +1784,37 @@ function hrTable(headers, rows, emptyText = 'No records yet.') {
   return `<div class="table-wrap"><table class="hr-table"><thead><tr>${headers.map((item) => `<th>${item}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${headers.length}" class="empty-state">${emptyText}</td></tr>`}</tbody></table></div>`;
 }
 
-function hrFormField(label, name, type = 'text', options = null, required = true, value = '') {
+function hrGenderOptions(currentValue = '') {
+  const options = [['', 'Select gender'], ['Female', 'Female'], ['Male', 'Male'], ['Non-binary', 'Non-binary'], ['Other', 'Other'], ['Prefer not to say', 'Prefer not to say']];
+  if (currentValue && !options.some(([value]) => value === currentValue)) options.push([currentValue, `${currentValue} (legacy)`]);
+  return options;
+}
+
+function bindHrInputRules(root = document) {
+  root.querySelectorAll('[data-input-rule]').forEach((input) => {
+    input.addEventListener('input', () => {
+      if (input.dataset.inputRule === 'digits') input.value = input.value.replace(/\D/g, '').slice(0, 20);
+      if (input.dataset.inputRule === 'national-id') input.value = input.value.replace(/\D/g, '').slice(0, 20);
+      if (input.dataset.inputRule === 'person') input.value = input.value.replace(/[^\p{L}\p{M} .'-]/gu, '').slice(0, 100);
+    });
+  });
+}
+
+function hrFormField(label, name, type = 'text', options = null, required = true, value = '', validationRule = '') {
+  const validationAttributes = validationRule === 'digits'
+    ? 'inputmode="numeric" pattern="[0-9]{1,20}" maxlength="20" data-input-rule="digits" title="Use digits only."'
+    : validationRule === 'digits-edit'
+      ? 'inputmode="numeric" maxlength="20" data-input-rule="digits" title="Use digits only."'
+        : validationRule === 'national-id'
+          ? 'inputmode="numeric" pattern="[0-9]{6,20}" maxlength="20" data-input-rule="national-id" title="Use 6-20 digits only."'
+          : validationRule === 'national-id-edit'
+            ? 'inputmode="numeric" maxlength="20" data-input-rule="national-id" title="Use 6-20 digits only."'
+            : validationRule === 'person'
+              ? 'maxlength="100" data-input-rule="person" title="Use letters, spaces, apostrophes, periods, or hyphens."'
+              : '';
   const control = options
     ? `<select name="${name}" ${required ? 'required' : ''}>${options.map(([optionValue, optionLabel]) => `<option value="${escapeHtml(optionValue)}" ${String(value) === String(optionValue) ? 'selected' : ''}>${escapeHtml(optionLabel)}</option>`).join('')}</select>`
-    : `<input name="${name}" type="${type}" value="${escapeHtml(value)}" ${required ? 'required' : ''} ${type === 'number' ? 'step="0.01"' : ''} />`;
+    : `<input name="${name}" type="${type}" value="${escapeHtml(value)}" ${required ? 'required' : ''} ${type === 'number' ? 'step="0.01"' : ''} ${type === 'tel' ? 'inputmode="tel" pattern="[+0-9(). -]{7,24}" maxlength="24" title="Use 7-15 digits; standard phone punctuation is allowed."' : ''} ${validationAttributes} />`;
   return `<label>${label}${control}</label>`;
 }
 
@@ -1392,11 +1829,11 @@ function renderHrEmployees() {
   const departments = hrState.workspace.departments.map((item) => [item.id, item.name]);
   const positions = hrState.workspace.positions.map((item) => [item.id, item.name]);
   const form = hasRolePermission('hr:employees:create') ? `<details class="hr-form-disclosure"><summary>Add employee</summary><form class="hr-form" data-hr-form="employee">
-    ${hrFormField('Employee number', 'employeeNumber')}${hrFormField('First name', 'firstName')}${hrFormField('Last name', 'lastName')}
-    ${hrFormField('Date of birth', 'dateOfBirth', 'date', null, false)}${hrFormField('Gender', 'gender', 'text', null, false)}
-    ${hrFormField('National ID', 'nationalId', 'text', null, false)}${hrFormField('Address', 'address', 'text', null, false)}
+    ${hrFormField('Employee number (digits only)', 'employeeNumber', 'text', null, true, '', 'digits')}${hrFormField('First name', 'firstName', 'text', null, true, '', 'person')}${hrFormField('Last name', 'lastName', 'text', null, true, '', 'person')}
+    ${hrFormField('Date of birth', 'dateOfBirth', 'date', null, false)}${hrFormField('Gender', 'gender', 'text', hrGenderOptions(), false)}
+    ${hrFormField('National ID', 'nationalId', 'text', null, false, '', 'national-id')}${hrFormField('Address', 'address', 'text', null, false)}
     ${hrFormField('Email', 'email', 'email', null, false)}${hrFormField('Phone', 'phone', 'tel', null, false)}
-    ${hrFormField('Emergency contact', 'emergencyName', 'text', null, false)}${hrFormField('Emergency phone', 'emergencyPhone', 'tel', null, false)}
+    ${hrFormField('Emergency contact', 'emergencyName', 'text', null, false, '', 'person')}${hrFormField('Emergency phone', 'emergencyPhone', 'tel', null, false)}
     ${hrFormField('Relationship', 'emergencyRelationship', 'text', null, false)}
     ${hrFormField('Department', 'departmentId', 'text', departments)}${hrFormField('Position', 'positionId', 'text', positions)}
     ${hrFormField('Employment type', 'employmentType', 'text', [['Full-time', 'Full-time'], ['Part-time', 'Part-time'], ['Contract', 'Contract'], ['Temporary', 'Temporary']])}
@@ -1487,6 +1924,66 @@ function getFilteredAttendanceRecords() {
   });
 }
 
+function renderAttendanceCalendar(today) {
+  const month = /^\d{4}-\d{2}$/.test(hrState.attendanceMonth) ? hrState.attendanceMonth : today.slice(0, 7);
+  const [year, monthNumber] = month.split('-').map(Number);
+  const daysInMonth = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const firstWeekday = new Date(Date.UTC(year, monthNumber - 1, 1)).getUTCDay();
+  const attendanceByDate = new Map();
+  for (const record of applicationData.attendanceRecords) {
+    const date = String(record.date || '').slice(0, 10);
+    if (!date.startsWith(`${month}-`)) continue;
+    const items = attendanceByDate.get(date) || [];
+    items.push(record);
+    attendanceByDate.set(date, items);
+  }
+
+  const cells = Array.from({ length: firstWeekday }, () => '<div class="attendance-calendar-empty" aria-hidden="true"></div>');
+  const fastingPeriods = new Set();
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    const date = `${month}-${String(day).padStart(2, '0')}`;
+    const calendarDay = getAttendanceCalendarDay(date);
+    const records = attendanceByDate.get(date) || [];
+    const present = records.filter((record) => record.checkIn && String(record.status || '').toLowerCase() !== 'absent').length;
+    const absent = records.filter((record) => String(record.status || '').toLowerCase() === 'absent').length;
+    calendarDay.fasting.forEach((period) => fastingPeriods.add(period));
+    const classes = [
+      'attendance-calendar-day',
+      calendarDay.isSunday ? 'is-rest-day' : '',
+      calendarDay.events.length ? 'is-holiday' : '',
+      date === today ? 'is-today' : '',
+      calendarDay.fasting.length ? 'is-fasting' : '',
+    ].filter(Boolean).join(' ');
+    const labels = [
+      ...(calendarDay.isSunday ? ['Weekly rest day'] : []),
+      ...calendarDay.events,
+      ...(calendarDay.fasting.length ? ['Fasting period'] : []),
+    ].map((label) => `<span class="attendance-calendar-label">${escapeHtml(label)}</span>`).join('');
+    const attendanceCount = records.length
+      ? `<small class="attendance-calendar-count">${present} present · ${absent} absent</small>`
+      : '';
+    cells.push(`<div class="${classes}" aria-label="${escapeHtml(`${date}, ${calendarDay.ethiopianDate}${calendarDay.events.length ? `, ${calendarDay.events.join(', ')}` : ''}${calendarDay.isSunday ? ', weekly rest day' : ''}`)}">
+      <time datetime="${date}" class="attendance-calendar-date">${day}</time>
+      <small class="attendance-calendar-ethiopian">${escapeHtml(calendarDay.ethiopianDate)}</small>
+      <div class="attendance-calendar-labels">${labels}</div>${attendanceCount}
+    </div>`);
+  }
+
+  const fastingNote = fastingPeriods.size
+    ? `<p class="attendance-fasting-note">${escapeHtml([...fastingPeriods].join(' and '))}: allow a meal or iftar break around local sunset (EAT), according to the employee's observance. Break timing is not deducted automatically.</p>`
+    : '';
+  return `<section class="attendance-calendar" aria-label="Attendance calendar">
+    <div class="attendance-calendar-heading"><div><h4>Attendance calendar</h4><p>Gregorian dates with Ethiopian calendar observances</p></div><label>Month<input type="month" id="hr-attendance-month" value="${escapeHtml(month)}" /></label></div>
+    <div class="attendance-calendar-legend" aria-label="Calendar legend"><span class="legend-rest">Weekly rest day</span><span class="legend-holiday">Holiday</span><span class="legend-fasting">Fasting period</span></div>
+    <p class="attendance-calendar-note">Islamic holiday dates are estimates and may vary with local moon sightings.</p>
+    ${fastingNote}
+    <div class="attendance-calendar-scroll"><div class="attendance-calendar-grid" role="grid" aria-label="${escapeHtml(month)} attendance calendar">
+      ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((weekday) => `<div class="attendance-calendar-weekday" role="columnheader">${weekday}</div>`).join('')}
+      ${cells.join('')}
+    </div></div>
+  </section>`;
+}
+
 function renderHrAttendance() {
   const canManage = hasRolePermission('hr:attendance:manage');
   const today = attendanceDateKey();
@@ -1538,6 +2035,7 @@ function renderHrAttendance() {
       <article><span>Awaiting check-out</span><strong>${openCount}</strong><small>today, East Africa Time</small></article>
       <article><span>Hours recorded</span><strong>${hoursTotal.toFixed(2)}</strong><small>in selected date range</small></article>
     </div>
+    ${renderAttendanceCalendar(today)}
     ${filters}
     <p class="attendance-result-count">Showing ${records.length} of ${applicationData.attendanceRecords.length} attendance records.</p>
     ${hrTable(['Date (EAT)', 'Employee', 'Check in (EAT)', 'Check out (EAT)', 'Hours', 'Overtime', 'Late', 'Status', 'Actions'], rows, 'No attendance records match these filters.')}`;
@@ -1620,6 +2118,7 @@ function renderAccountingWorkspace() {
   const canCreateJournal = hasRolePermission('accounting:journals:create');
   const canManageAccounts = hasRolePermission('accounting:accounts:manage');
   const canManagePeriods = hasRolePermission('accounting:periods:manage');
+  const canManageBudgets = hasRolePermission('accounting:budgets:manage');
   const table = (headers, rows) => `<div class="table-wrap"><table class="accounting-table"><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${headers.length}" class="empty-state">No records available.</td></tr>`}</tbody></table></div>`;
   const action = (journal, key, label, permission) => hasRolePermission(permission)
     ? `<button class="small-action" type="button" data-accounting-action="${key}" data-journal="${journal.id}">${label}</button>` : '';
@@ -1633,10 +2132,20 @@ function renderAccountingWorkspace() {
   const report = accountingState.reports;
   const reportRows = (report.trialBalance?.accounts || []).map((account) => `<tr><td>${escapeHtml(account.accountCode)}</td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(account.accountType)}</td><td>${formatCurrency(Number(account.debit))}</td><td>${formatCurrency(Number(account.credit))}</td><td>${formatCurrency(Number(account.closingBalance))}</td></tr>`).join('');
   const year = new Date().getFullYear();
+  const monthStart = `${year}-${String(new Date().getMonth() + 1).padStart(2, '0')}-01`;
   const defaultLines = accounts.length > 1
-    ? [{ accountId: accounts[0].id, debit: 100, credit: 0, description: 'Debit line' }, { accountId: accounts[1].id, debit: 0, credit: 100, description: 'Credit line' }]
+    ? [{ accountId: accounts[0].id, debit: 100, credit: 0, description: 'Debit line', costCenter: '', profitCenter: '' }, { accountId: accounts[1].id, debit: 0, credit: 100, description: 'Credit line', costCenter: '', profitCenter: '' }]
     : [];
+  const budgetRows = accountingState.budgets.filter((line) => line.line_id).map((line) => `<tr><td>${escapeHtml(line.budget_code)} · ${escapeHtml(line.budget_name)}</td><td>${line.fiscal_year}</td><td>${escapeHtml(String(line.period_start).slice(0, 7))}</td><td>${escapeHtml(line.account_code)} · ${escapeHtml(line.account_name)}</td><td>${escapeHtml(line.cost_center_code || '—')}</td><td>${escapeHtml(line.profit_center_code || '—')}</td><td>${formatCurrency(Number(line.budget_amount))}</td><td>${formatCurrency(Number(line.actual_amount))}</td><td>${formatCurrency(Number(line.variance))}</td></tr>`).join('');
   const forms = `
+    ${canManageBudgets ? `<details class="accounting-form-disclosure"><summary>Plan a monthly budget</summary><form class="accounting-form" data-accounting-form="budget-line">
+      <label>Budget code<input name="budgetCode" maxlength="40" required placeholder="FY2026-OPS" /></label><label>Budget name<input name="budgetName" maxlength="160" required placeholder="Operating budget" /></label>
+      <label>Fiscal year<input name="fiscalYear" type="number" min="2000" max="9999" value="${year}" required /></label><label>Month<input name="periodStart" type="month" value="${monthStart.slice(0, 7)}" required /></label>
+      <label>Account<select name="accountId" required>${accounts.filter((account) => account.active).map((account) => `<option value="${account.id}">${escapeHtml(account.account_code)} · ${escapeHtml(account.account_name)}</option>`).join('')}</select></label>
+      <label>Cost center code<input name="costCenterCode" maxlength="40" placeholder="Optional governance code" /></label><label>Profit center code<input name="profitCenterCode" maxlength="40" placeholder="Optional governance code" /></label>
+      <label>Budget amount<input name="amount" type="number" min="0" step="0.01" required /></label>
+      <button class="primary-btn" type="submit">Save budget line</button><span class="accounting-error" role="alert"></span>
+    </form></details>` : ''}
     ${canManageAccounts ? `<details class="accounting-form-disclosure"><summary>New account</summary><form class="accounting-form" data-accounting-form="account">
       <label>Code<input name="accountCode" required /></label><label>Name<input name="accountName" required /></label>
       <label>Type<select name="accountType">${[['ASSET','Asset'],['LIABILITY','Liability'],['EQUITY','Equity'],['REVENUE','Revenue'],['COGS','Cost of goods sold'],['OPERATING_EXPENSE','Operating expense'],['OTHER_INCOME','Other income'],['OTHER_EXPENSE','Other expense']].map(([value,label]) => `<option value="${value}">${label}</option>`).join('')}</select></label>
@@ -1660,8 +2169,9 @@ function renderAccountingWorkspace() {
     journals: `${forms}<h3>Journal entries</h3>${table(['Number','Date','Description','Source','Status','Workflow'], journalRows)}`,
     periods: `${forms}<div class="accounting-section-heading"><h3>Accounting periods</h3>${canManagePeriods ? `<form class="accounting-year-close" data-accounting-form="year-close"><label>Fiscal year<input name="fiscalYear" type="number" value="${year}" required /></label><label>Retained earnings code<input name="retainedEarningsCode" value="3100" required /></label><button class="danger-btn" type="submit">Close fiscal year</button><span class="accounting-error" role="alert"></span></form>` : ''}</div>${table(['Fiscal year','Period','Start','End','Status','Action'], periods.map((period) => `<tr><td>${period.fiscal_year}</td><td>${period.period_number}</td><td>${String(period.period_start).slice(0,10)}</td><td>${String(period.period_end).slice(0,10)}</td><td>${renderStatus(period.status)}</td><td>${period.status === 'OPEN' && canManagePeriods ? `<button class="small-action" data-accounting-close-period="${period.id}">Close period</button>` : ''}</td></tr>`).join(''))}`,
     reports: `<div class="accounting-report-summary"><article><span>Revenue</span><strong>${formatCurrency(Number(report.profitAndLoss?.revenue || 0))}</strong></article><article><span>Expenses</span><strong>${formatCurrency(Number(report.profitAndLoss?.expenses || 0))}</strong></article><article><span>Net income</span><strong>${formatCurrency(Number(report.profitAndLoss?.netIncome || 0))}</strong></article><article><span>Cash movement</span><strong>${formatCurrency(Number(report.cashFlow?.netCashFlow || 0))}</strong></article><article><span>Assets</span><strong>${formatCurrency(Number(report.balanceSheet?.assets || 0))}</strong></article><article><span>Liabilities + equity</span><strong>${formatCurrency(Number(report.balanceSheet?.totalLiabilitiesAndEquity || 0))}</strong></article></div><h3>Trial balance</h3>${table(['Code','Account','Type','Debits','Credits','Balance'], reportRows)}`,
+    budgets: `${forms}<h3>Monthly budget versus posted actuals</h3><p>Actuals include posted general-ledger journals only and are matched by account, month, cost center, and profit center. Positive variance means budget is above actual.</p>${table(['Budget','Year','Month','Account','Cost center','Profit center','Budget','Actual','Variance'], budgetRows)}`,
   };
-  const tabs = [['ledger','General ledger'],['accounts','Chart of accounts'],['journals','Journals'],['periods','Periods'],['reports','Financial reports']];
+  const tabs = [['ledger','General ledger'],['accounts','Chart of accounts'],['journals','Journals'],['periods','Periods'],['budgets','Budgets'],['reports','Financial reports']];
   return `<section class="content-panel accounting-workspace"><div class="panel-header"><div><p class="eyebrow">General ledger</p><h2>Accounting engine</h2></div><button class="secondary-btn" type="button" data-accounting-refresh>Refresh</button></div><nav class="finance-tabs" aria-label="Finance sections"><button type="button" data-finance-tab="overview">Transactions</button><button type="button" data-finance-tab="accounting" class="active">Accounting</button></nav>${accountingState.error ? `<p class="accounting-error" role="alert">${escapeHtml(accountingState.error)}</p>` : ''}<nav class="accounting-tabs" aria-label="Accounting sections">${tabs.map(([key,label]) => `<button type="button" data-accounting-tab="${key}" class="${accountingState.tab === key ? 'active' : ''}">${label}</button>`).join('')}</nav><div class="accounting-content">${contents[accountingState.tab] || contents.ledger}</div></section>`;
 }
 
@@ -1892,7 +2402,7 @@ function renderManufacturingOverview() {
 function renderManufacturing() {
   const workspace = manufacturingState.workspace;
   if (!workspace) return renderManufacturingOverview();
-  const tabs = [['overview', 'Overview'], ['boms', 'BOM'], ['routing', 'Routing & centers'], ['orders', 'Work orders'], ['quality', 'Quality'], ['mrp', 'MRP'], ['reports', 'Reports']];
+  const tabs = [['overview', 'Overview'], ['boms', 'BOM'], ['routing', 'Routing & centers'], ['orders', 'Work orders'], ['quality', 'Quality'], ['planning', 'Forecast & maintenance'], ['mrp', 'MRP'], ['reports', 'Reports']];
   const active = tabs.some(([key]) => key === manufacturingState.tab) ? manufacturingState.tab : 'overview';
   const products = workspace.products || [];
   const warehouses = workspace.warehouses || [];
@@ -1910,6 +2420,8 @@ function renderManufacturing() {
   const routingRows = (workspace.routings || []).map((routing) => `<tr><td>${escapeHtml(routing.routing_code)}</td><td>${escapeHtml(routing.version)}</td><td>${escapeHtml(routing.finished_sku)} · ${escapeHtml(routing.finished_name)}</td><td>${routing.operation_count}</td><td>${escapeHtml(String(routing.effective_from).slice(0,10))}</td><td>${routing.active ? 'Active' : 'Inactive'}</td></tr>`).join('');
   const orderRows = (workspace.orders || []).map((order) => `<tr><td><button class="link-action" data-manufacturing-select-order="${order.id}">${escapeHtml(order.order_number)}</button></td><td>${escapeHtml(order.finished_sku)} · ${escapeHtml(order.finished_name)}</td><td>${Number(order.planned_quantity)}</td><td>${Number(order.completed_quantity)} good / ${Number(order.rejected_quantity)} rejected</td><td>${escapeHtml(order.warehouse_name)}</td><td>${escapeHtml(order.due_date ? String(order.due_date).slice(0,10) : '—')}</td><td>${renderStatus(order.status)}</td><td>${order.status === 'PLANNED' && hasRolePermission('manufacturing:orders:release') ? `<button class="small-action" data-manufacturing-action="release" data-id="${order.id}">Reserve & release</button>` : ''}${order.status === 'RELEASED' && hasRolePermission('manufacturing:orders:release') ? `<button class="small-action" data-manufacturing-action="start" data-id="${order.id}">Start</button>` : ''}${order.status === 'COMPLETED' && hasRolePermission('manufacturing:orders:release') ? `<button class="small-action" data-manufacturing-action="close" data-id="${order.id}">Close</button>` : ''}</td></tr>`).join('');
   const qualityRows = (manufacturingState.qualityInspections || []).map((inspection) => `<tr><td>${escapeHtml(inspection.lot_number)}</td><td>${escapeHtml(inspection.sku)} · ${escapeHtml(inspection.product_name)}</td><td>${escapeHtml(inspection.order_number || inspection.lot_type)}</td><td>${escapeHtml(inspection.inspection_stage)}</td><td>${Number(inspection.inspected_quantity)}</td><td>${Number(inspection.passed_quantity)}</td><td>${Number(inspection.failed_quantity)}</td><td>${renderStatus(inspection.result)}</td><td>${escapeHtml(inspection.defect_code || '')}</td><td>${escapeHtml(inspection.inspector_username || '')}</td><td>${escapeHtml(String(inspection.inspected_at).slice(0, 16).replace('T', ' '))}</td></tr>`).join('');
+  const forecastRows = (workspace.forecasts || []).map((item) => `<tr><td>${escapeHtml(item.sku)} · ${escapeHtml(item.product_name)}</td><td>${escapeHtml(String(item.forecast_date).slice(0, 10))}</td><td>${Number(item.quantity)}</td><td>${escapeHtml(item.notes || '')}</td></tr>`).join('');
+  const maintenanceRows = (workspace.maintenance || []).map((item) => `<tr><td>${escapeHtml(item.work_center_code)} · ${escapeHtml(item.work_center_name)}</td><td>${escapeHtml(item.maintenance_type)}</td><td>${escapeHtml(item.description)}</td><td>${escapeHtml(String(item.scheduled_date).slice(0, 10))}</td><td>${item.next_due_date ? escapeHtml(String(item.next_due_date).slice(0, 10)) : '—'}</td><td>${Number(item.downtime_minutes)} min</td><td>${renderStatus(item.status)}</td><td>${item.status === 'PLANNED' && hasRolePermission('manufacturing:routing:manage') ? `<button class="small-action" data-manufacturing-action="maintenance-complete" data-id="${item.id}">Complete</button>` : ''}</td></tr>`).join('');
   const createOrderFields = `<label>Finished product<select name="finishedProductId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Active BOM<select name="bomId" required>${bomOptions}</select></label><label>Routing<select name="routingId"><option value="">No routing</option>${routingOptions}</select></label><label>Warehouse<select name="warehouseId" required>${warehouses.map((warehouse) => `<option value="${warehouse.id}">${escapeHtml(warehouse.code)} · ${escapeHtml(warehouse.name)}</option>`).join('')}</select></label><label>Planned quantity<input name="plannedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Planned start<input name="plannedStart" type="date" /></label><label>Due date<input name="dueDate" type="date" /></label>`;
   const selectedOrder = manufacturingState.selectedOrder;
   const orderDetail = selectedOrder ? `<section class="manufacturing-detail"><div class="manufacturing-detail-header"><div><p class="eyebrow">${escapeHtml(selectedOrder.order_number)}</p><h3>${escapeHtml(selectedOrder.finished_name)} · ${renderStatus(selectedOrder.status)}</h3></div><button class="small-action" data-manufacturing-refresh-order="${selectedOrder.id}">Refresh detail</button></div><h4>Material plan and actual consumption</h4>${table(['Material','Required','Reserved','Consumed','Unit','Material cost'],selectedOrder.materials.map((material) => `<tr><td>${escapeHtml(material.sku)} · ${escapeHtml(material.name)}</td><td>${Number(material.required_quantity)}</td><td>${Number(material.reserved_quantity)}</td><td>${Number(material.consumed_quantity)}</td><td>${escapeHtml(material.uom_code)}</td><td>${formatCurrency(Number(material.consumed_quantity)*Number(material.unit_cost))}</td></tr>`).join(''))}<h4>Routing execution</h4>${table(['Seq','Operation','Work center','Status','Planned machine/labor h','Actual machine/labor h','Action'],selectedOrder.operations.map((operation) => `<tr><td>${operation.sequence_number}</td><td>${escapeHtml(operation.operation_name)}</td><td>${escapeHtml(operation.work_center_name)}</td><td>${renderStatus(operation.status)}</td><td>${Number(operation.planned_machine_hours).toFixed(2)} / ${Number(operation.planned_labor_hours).toFixed(2)}</td><td>${Number(operation.actual_machine_hours).toFixed(2)} / ${Number(operation.actual_labor_hours).toFixed(2)}</td><td>${operation.status === 'PLANNED' && selectedOrder.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:orders:release') ? `<button class="small-action" data-manufacturing-action="start-operation" data-order="${selectedOrder.id}" data-id="${operation.id}">Start</button>` : ''}${operation.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:output:record') ? `<form class="manufacturing-inline-operation" data-manufacturing-form="complete-operation" data-order="${selectedOrder.id}" data-operation="${operation.id}"><label>Machine h<input name="actualMachineHours" type="number" min="0" step="0.01" value="${Number(operation.planned_machine_hours)}" required /></label><label>Labor h<input name="actualLaborHours" type="number" min="0" step="0.01" value="${Number(operation.planned_labor_hours)}" required /></label><button class="small-action" type="submit">Complete</button><span class="manufacturing-form-error" role="alert"></span></form>` : ''}</td></tr>`).join(''))}<h4>Production batches</h4>${table(['Batch','Production date','Good quantity','Rejected','Unit cost'],selectedOrder.outputs.map((output) => `<tr><td>${escapeHtml(output.lot_number)}</td><td>${String(output.production_date).slice(0,10)}</td><td>${Number(output.produced_quantity)}</td><td>${Number(output.rejected_quantity)}</td><td>${formatCurrency(Number(output.unit_cost))}</td></tr>`).join(''))}${selectedOrder.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:materials:consume') ? `<form class="manufacturing-data-form compact-manufacturing-form" data-manufacturing-form="consume" data-order="${selectedOrder.id}"><h4>Consume reserved material</h4><label>Material<select name="productId">${selectedOrder.materials.map((material) => `<option value="${material.raw_material_product_id}">${escapeHtml(material.sku)} · ${escapeHtml(material.name)}</option>`).join('')}</select></label><label>Quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label><label>Raw lot number<input name="lotNumber" required /></label><button class="primary-btn" type="submit">Record consumption</button><span class="manufacturing-form-error" role="alert"></span></form>` : ''}${selectedOrder.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:output:record') ? `<form class="manufacturing-data-form compact-manufacturing-form" data-manufacturing-form="output" data-order="${selectedOrder.id}"><h4>Record finished output</h4><label>Good quantity<input name="producedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Rejected quantity<input name="rejectedQuantity" type="number" min="0" step="0.001" value="0" /></label><label>Batch number<input name="batchNumber" /></label><label>Production date<input name="productionDate" type="date" value="${today()}" required /></label><button class="primary-btn" type="submit">Post finished output</button><span class="manufacturing-form-error" role="alert"></span></form>` : ''}</section>` : '';
@@ -1923,7 +2435,8 @@ function renderManufacturing() {
     routing: `${form('work-center','Create work center',`<label>Code<input name="code" required /></label><label>Name<input name="name" required /></label><label>Machine<input name="machineName" /></label><label>Machine capacity<input name="machineCapacity" type="number" min="0.001" step="0.1" value="1" required /></label><label>Labor capacity<input name="laborCapacity" type="number" min="0.001" step="0.1" value="1" required /></label><label>Machine hourly cost<input name="machineHourRate" type="number" min="0" step="0.01" value="0" /></label><label>Labor hourly cost<input name="laborHourRate" type="number" min="0" step="0.01" value="0" /></label><label>Overhead hourly cost<input name="overheadHourRate" type="number" min="0" step="0.01" value="0" /></label><label class="manufacturing-wide">Calendar JSON<textarea name="calendar" rows="3">{"workingDays":[1,2,3,4,5],"hoursPerDay":8}</textarea></label>`,'manufacturing:routing:manage')}${form('routing','Create routing version',`<label>Finished product<select name="finishedProductId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Routing code<input name="routingCode" required /></label><label>Version<input name="version" required /></label><label>Effective from<input name="effectiveFrom" type="date" value="${today()}" required /></label><label class="manufacturing-wide">Operations JSON<textarea name="operations" rows="5" required>${escapeHtml(JSON.stringify(operationSample,null,2))}</textarea></label>`,'manufacturing:routing:manage')}<h3>Work centers</h3>${table(['Code','Center','Machine','Machine capacity','Labor capacity','Machine cost/h','Labor cost/h','Overhead/h','Status'],centerRows)}<h3>Routings</h3>${table(['Code','Version','Finished product','Operations','Effective','Active'],routingRows)}`,
     orders: `${form('order','Plan manufacturing order',createOrderFields,'manufacturing:orders:create')}<h3>Production orders</h3>${table(['Order','Finished product','Planned','Output','Warehouse','Due','Status','Action'],orderRows)}${orderDetail}`,
     quality: `${form('quality','Record lot inspection',`<label>Lot<select name="lotId" required>${lotOptions}</select></label><label>Inspection stage<select name="inspectionStage"><option value="INCOMING">Incoming</option><option value="IN_PROCESS">In process</option><option value="FINAL">Final</option></select></label><label>Inspected quantity<input name="inspectedQuantity" type="number" min="0.000001" step="0.000001" required /></label><label>Passed quantity<input name="passedQuantity" type="number" min="0" step="0.000001" value="0" required /></label><label>Failed quantity<input name="failedQuantity" type="number" min="0" step="0.000001" value="0" required /></label><label>Defect code<input name="defectCode" maxlength="80" /></label><label class="manufacturing-wide">Notes<textarea name="notes" rows="2"></textarea></label>`,'manufacturing:quality:manage')}<h3>Inspection history</h3>${table(['Lot','Product','Order / lot type','Stage','Inspected','Passed','Failed','Result','Defect','Inspector','Inspected at'],qualityRows)}`,
-    mrp: `${form('mrp','Run MRP',`<label>Planning date<input name="planningDate" type="date" value="${today()}" required /></label><label>Demand horizon end<input name="endDate" type="date" /></label><label class="manufacturing-wide">Override demand JSON (optional)<textarea name="demands" rows="3" placeholder='[{"productId":"...","quantity":100}]'></textarea></label>`,'manufacturing:mrp:run')}${form('purchase-supply','Register open purchase supply',`<label>PO number<input name="purchaseOrderNumber" required /></label><label>Material<select name="productId" required>${productOptions(['RAW_MATERIAL','SEMI_FINISHED_GOOD'])}</select></label><label>Ordered quantity<input name="orderedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Due date<input name="dueDate" type="date" /></label>`,'manufacturing:mrp:run')}${form('raw-lot','Register raw material lot',`<label>Receipt transaction<select name="inventoryTransactionId" required>${workspace.inventoryReceipts.map((receipt) => { const product=products.find((item)=>item.id===receipt.product_id); return `<option value="${receipt.id}">${escapeHtml(product?.sku || receipt.product_id)} · ${Number(receipt.quantity)} · ${escapeHtml(String(receipt.transaction_date).slice(0,10))}</option>`; }).join('')}</select></label><label>Lot number<input name="lotNumber" required /></label><label>Lot quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label>`,'manufacturing:materials:consume')}<div class="manufacturing-mrp-results"><div class="manufacturing-section-heading"><h3>Latest material requirements</h3>${hasRolePermission('manufacturing:reports:read') ? '<button type="button" class="secondary-btn" data-manufacturing-action="mrp-refresh">Refresh</button>' : ''}</div>${mrp ? table(['Material','Gross required','Safety','On hand','Reserved','Open purchase','Open production','Net requirement','Suggested'],mrp.requirements.map((item)=>`<tr><td>${escapeHtml(item.sku)} · ${escapeHtml(item.product_name)}</td><td>${Number(item.gross_required)}</td><td>${Number(item.safety_stock)}</td><td>${Number(item.on_hand)}</td><td>${Number(item.reserved)}</td><td>${Number(item.open_purchase)}</td><td>${Number(item.open_production)}</td><td>${Number(item.net_requirement)}</td><td>${Number(item.suggested_quantity)}</td></tr>`).join('')) : '<p>No MRP run yet.</p>'}</div><h3>Open purchase supply</h3>${table(['Purchase order','Material','Ordered','Received','Due','Status'],workspace.openPurchaseSupply.map((item)=>`<tr><td>${escapeHtml(item.purchase_order_number)}</td><td>${escapeHtml(products.find((product)=>product.id===item.product_id)?.sku || item.product_id)}</td><td>${Number(item.ordered_quantity)}</td><td>${Number(item.received_quantity)}</td><td>${item.due_date ? String(item.due_date).slice(0,10) : '—'}</td><td>${escapeHtml(item.status)}</td></tr>`).join(''))}`,
+    planning: `${form('forecast','Add demand forecast',`<label>Product<select name="productId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Forecast date<input name="forecastDate" type="date" value="${today()}" required /></label><label>Forecast quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label><label>Notes<input name="notes" maxlength="500" /></label>`,'manufacturing:mrp:run')}<h3>Demand forecast</h3>${table(['Product','Date','Quantity','Notes'],forecastRows)}${form('maintenance','Schedule equipment maintenance',`<label>Work center<select name="workCenterId" required>${(workspace.workCenters || []).filter((center)=>center.active).map((center)=>`<option value="${center.id}">${escapeHtml(center.code)} · ${escapeHtml(center.name)}</option>`).join('')}</select></label><label>Type<select name="maintenanceType"><option value="PREVENTIVE">Preventive</option><option value="CORRECTIVE">Corrective / downtime</option></select></label><label>Description<input name="description" maxlength="240" required /></label><label>Scheduled date<input name="scheduledDate" type="date" value="${today()}" required /></label><label>Next due date<input name="nextDueDate" type="date" /></label><label class="manufacturing-wide">Notes<textarea name="notes" rows="2"></textarea></label>`,'manufacturing:routing:manage')}<h3>Maintenance schedule and downtime</h3>${table(['Work center','Type','Description','Scheduled','Next due','Downtime','Status','Action'],maintenanceRows)}`,
+    mrp: `${form('mrp','Run MRP',`<label>Demand source<select name="demandSource"><option value="SALES_ORDERS">Approved sales orders</option><option value="FORECAST">Demand forecast</option><option value="COMBINED">Sales orders + forecast</option></select></label><label>Planning date<input name="planningDate" type="date" value="${today()}" required /></label><label>Demand horizon end<input name="endDate" type="date" /></label><label class="manufacturing-wide">Override demand JSON (optional)<textarea name="demands" rows="3" placeholder='[{"productId":"...","quantity":100}]'></textarea></label>`,'manufacturing:mrp:run')}${form('purchase-supply','Register open purchase supply',`<label>PO number<input name="purchaseOrderNumber" required /></label><label>Material<select name="productId" required>${productOptions(['RAW_MATERIAL','SEMI_FINISHED_GOOD'])}</select></label><label>Ordered quantity<input name="orderedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Due date<input name="dueDate" type="date" /></label>`,'manufacturing:mrp:run')}${form('raw-lot','Register raw material lot',`<label>Receipt transaction<select name="inventoryTransactionId" required>${workspace.inventoryReceipts.map((receipt) => { const product=products.find((item)=>item.id===receipt.product_id); return `<option value="${receipt.id}">${escapeHtml(product?.sku || receipt.product_id)} · ${Number(receipt.quantity)} · ${escapeHtml(String(receipt.transaction_date).slice(0,10))}</option>`; }).join('')}</select></label><label>Lot number<input name="lotNumber" required /></label><label>Lot quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label>`,'manufacturing:materials:consume')}<div class="manufacturing-mrp-results"><div class="manufacturing-section-heading"><h3>Latest material requirements</h3>${hasRolePermission('manufacturing:reports:read') ? '<button type="button" class="secondary-btn" data-manufacturing-action="mrp-refresh">Refresh</button>' : ''}</div>${mrp ? table(['Material','Gross required','Safety','On hand','Reserved','Open purchase','Open production','Net requirement','Suggested'],mrp.requirements.map((item)=>`<tr><td>${escapeHtml(item.sku)} · ${escapeHtml(item.product_name)}</td><td>${Number(item.gross_required)}</td><td>${Number(item.safety_stock)}</td><td>${Number(item.on_hand)}</td><td>${Number(item.reserved)}</td><td>${Number(item.open_purchase)}</td><td>${Number(item.open_production)}</td><td>${Number(item.net_requirement)}</td><td>${Number(item.suggested_quantity)}</td></tr>`).join('')) : '<p>No MRP run yet.</p>'}</div><h3>Open purchase supply</h3>${table(['Purchase order','Material','Ordered','Received','Due','Status'],workspace.openPurchaseSupply.map((item)=>`<tr><td>${escapeHtml(item.purchase_order_number)}</td><td>${escapeHtml(products.find((product)=>product.id===item.product_id)?.sku || item.product_id)}</td><td>${Number(item.ordered_quantity)}</td><td>${Number(item.received_quantity)}</td><td>${item.due_date ? String(item.due_date).slice(0,10) : '—'}</td><td>${escapeHtml(item.status)}</td></tr>`).join(''))}`,
     reports: `<label class="manufacturing-report-select">Report<select id="manufacturing-report-type">${[['production-plan','Production plan'],['orders','Production orders'],['consumption','Material consumption'],['variance','Production variance'],['wip','WIP'],['production-cost','Production cost'],['machine-utilization','Machine utilization'],['yield','Yield and scrap'],['scrap','Scrap']].map(([value,label])=>`<option value="${value}" ${manufacturingState.reportType===value?'selected':''}>${label}</option>`).join('')}</select></label><div class="manufacturing-section-heading"><h3>${escapeHtml(manufacturingState.reportType)}</h3><button type="button" class="secondary-btn" data-manufacturing-action="load-report">Refresh</button></div>${reportTable}<h3>Batch traceability</h3><form class="manufacturing-data-form compact-manufacturing-form" data-manufacturing-form="trace"><label>Batch / lot number<input name="lotNumber" required /></label><button class="primary-btn" type="submit">Trace lot</button><span class="manufacturing-form-error" role="alert"></span></form>${manufacturingState.trace ? `<pre class="manufacturing-trace">${escapeHtml(JSON.stringify(manufacturingState.trace,null,2))}</pre>` : ''}`,
   };
   return `<section class="content-panel manufacturing-workspace"><div class="panel-header"><div><p class="eyebrow">Production operations</p><h2>Manufacturing control</h2></div><button type="button" class="secondary-btn" data-manufacturing-action="refresh">Refresh</button></div>${manufacturingState.error ? `<p class="manufacturing-error" role="alert">${escapeHtml(manufacturingState.error)}</p>` : ''}<nav class="manufacturing-tabs" aria-label="Manufacturing sections">${tabs.map(([key,label])=>`<button type="button" data-manufacturing-tab="${key}" class="${active===key?'active':''}">${label}</button>`).join('')}</nav><div class="manufacturing-content">${contents[active]}</div></section>`;
@@ -2067,6 +2580,11 @@ async function handleManufacturingDataForm(event) {
       if (values.demands.trim()) {
         try { payload.demands = JSON.parse(values.demands); } catch { throw new Error('MRP demand override must be valid JSON.'); }
       } else delete payload.demands;
+    } else if (type === 'forecast') {
+      endpoint = '/api/manufacturing/forecasts';
+      payload.quantity = Number(values.quantity);
+    } else if (type === 'maintenance') {
+      endpoint = '/api/manufacturing/maintenance';
     } else if (type === 'purchase-supply') {
       endpoint = '/api/manufacturing/mrp/open-supply';
       payload.orderedQuantity = Number(values.orderedQuantity);
@@ -2115,6 +2633,13 @@ async function handleManufacturingAction(action, id, orderId) {
     let body = {};
     let method = 'POST';
     if (action === 'activate-bom') endpoint = `/api/manufacturing/boms/${encodeURIComponent(id)}/activate`;
+    else if (action === 'maintenance-complete') {
+      const downtime = window.prompt('Actual equipment downtime in minutes:', '0');
+      if (downtime === null) return;
+      if (!Number.isFinite(Number(downtime)) || Number(downtime) < 0) throw new Error('Downtime must be a non-negative number of minutes.');
+      endpoint = `/api/manufacturing/maintenance/${encodeURIComponent(id)}/complete`;
+      body = { downtimeMinutes: Number(downtime) };
+    }
     else if (['release','start','close'].includes(action)) endpoint = `/api/manufacturing/work-orders/${encodeURIComponent(id)}/${action}`;
     else if (action === 'start-operation') endpoint = `/api/manufacturing/work-orders/${encodeURIComponent(orderId)}/operations/${encodeURIComponent(id)}/start`;
     else if (action === 'complete-operation') endpoint = `/api/manufacturing/work-orders/${encodeURIComponent(orderId)}/operations/${encodeURIComponent(id)}/complete`;
@@ -2266,6 +2791,13 @@ async function handleAccountingFormSubmit(event) {
       endpoint = '/api/accounting/periods';
       payload.fiscalYear = Number(values.fiscalYear);
       payload.periodNumber = Number(values.periodNumber);
+    } else if (type === 'budget-line') {
+      endpoint = '/api/accounting/budgets/lines';
+      payload.fiscalYear = Number(values.fiscalYear);
+      payload.periodStart = `${values.periodStart}-01`;
+      payload.amount = Number(values.amount);
+      payload.costCenterCode = values.costCenterCode.trim();
+      payload.profitCenterCode = values.profitCenterCode.trim();
     } else if (type === 'year-close') {
       endpoint = `/api/accounting/years/${encodeURIComponent(values.fiscalYear)}/close`;
       payload = { retainedEarningsCode: values.retainedEarningsCode };
@@ -2318,6 +2850,9 @@ async function handleSalesFormSubmit(event) {
     delivery: ['/api/sales/deliveries', 'POST'],
     invoice: ['/api/sales/invoices', 'POST'],
     payment: ['/api/sales/payments', 'POST'],
+    crm: ['/api/sales/crm', 'POST'],
+    activity: ['/api/sales/activities', 'POST'],
+    dispute: ['/api/sales/disputes', 'POST'],
   };
   const route = routes[type];
   if (!route) return;
@@ -2371,6 +2906,15 @@ async function handleSalesAction(recordId, action) {
     body.status = action.slice('delivery-'.length).replace(/^[a-z]/, (character) => character.toUpperCase());
   }
   if (action === 'invoice-issue') url = `/api/sales/invoices/${encodeURIComponent(recordId)}/issue`;
+  if (action === 'dispute-review' || action === 'dispute-resolve') {
+    url = `/api/sales/disputes/${encodeURIComponent(recordId)}/status`;
+    body.status = action === 'dispute-review' ? 'UNDER_REVIEW' : 'RESOLVED';
+    if (action === 'dispute-resolve') {
+      const resolution = window.prompt('Resolution note for this receivable dispute:');
+      if (!resolution?.trim()) return;
+      body.resolution = resolution.trim();
+    }
+  }
   if (!url) return;
   try {
     await fetchJson(url, { method: 'POST', body: JSON.stringify(body) });
@@ -2919,6 +3463,13 @@ function renderPage() {
       return renderReports();
     case 'settings':
       return renderSettings();
+    case 'governance':
+      return renderGovernancePage(
+        governanceState,
+        hasRolePermission('governance:manage'),
+        escapeHtml,
+        formatCurrency,
+      );
     case 'dashboard':
     default:
       return renderDashboard();
@@ -3046,6 +3597,23 @@ function render() {
     });
   });
 
+  document.querySelectorAll('[data-governance-tab]').forEach((button) => {
+    button.addEventListener('click', () => {
+      governanceState.tab = button.dataset.governanceTab;
+      render();
+    });
+  });
+  document.querySelectorAll('[data-governance-form]').forEach((form) => {
+    form.addEventListener('submit', handleGovernanceFormSubmit);
+  });
+  document.querySelectorAll('[data-governance-status]').forEach((button) => {
+    button.addEventListener('click', () => handleGovernanceStatus(button));
+  });
+  document.querySelector('[data-governance-refresh]')?.addEventListener('click', async () => {
+    await loadGovernanceData();
+    render();
+  });
+
   const menuToggle = document.getElementById('menu-toggle');
   const sidebar = document.getElementById('sidebar');
   menuToggle?.addEventListener('click', () => openSidebar());
@@ -3160,6 +3728,14 @@ function render() {
   document.querySelectorAll('[data-procurement-supplier-form]').forEach((form) => {
     form.addEventListener('submit', handleProcurementSupplierSubmit);
   });
+  document.querySelectorAll('[data-procurement-control]').forEach((form) => {
+    form.addEventListener('submit', handleProcurementControlSubmit);
+  });
+  document.querySelectorAll('[data-procurement-controlled-action]').forEach((button) => {
+    button.addEventListener('click', () => handleProcurementControlledAction({
+      dataset: { action: button.dataset.procurementControlledAction, id: button.dataset.id },
+    }));
+  });
   document.querySelectorAll('[data-procurement-comparison-form]').forEach((form) => {
     form.addEventListener('submit', handleProcurementComparisonSubmit);
     const updateTotals = () => {
@@ -3210,9 +3786,49 @@ function render() {
   document.querySelectorAll('[data-inventory-tab]').forEach((button) => {
     button.addEventListener('click', async () => {
       inventoryTransferState.tab = button.dataset.inventoryTab;
-      if (['transfers', 'counts'].includes(inventoryTransferState.tab)) await loadInventoryTransferData();
+      if (['transfers', 'counts', 'traceability'].includes(inventoryTransferState.tab)) await loadInventoryTransferData();
       render();
     });
+  });
+  document.querySelectorAll('[data-inventory-trace-receive]').forEach((form) => {
+    form.addEventListener('submit', handleInventoryTraceReceiveSubmit);
+  });
+  document.querySelectorAll('[data-inventory-tracked-issue]').forEach((form) => {
+    form.addEventListener('submit', handleInventoryTrackedIssueSubmit);
+  });
+  document.querySelectorAll('[data-inventory-reservation]').forEach((form) => {
+    form.addEventListener('submit', handleInventoryReservationSubmit);
+  });
+  document.querySelectorAll('[data-inventory-trace-lookup]').forEach((form) => {
+    form.addEventListener('submit', handleInventoryTraceLookupSubmit);
+  });
+  document.querySelectorAll('[data-reservation-release]').forEach((button) => {
+    button.addEventListener('click', () => handleInventoryReservationRelease(button.dataset.reservationRelease));
+  });
+  document.querySelectorAll('[data-lot-quality]').forEach((button) => {
+    button.addEventListener('click', () => handleInventoryLotQuality(button.dataset.lotId, button.dataset.lotQuality));
+  });
+  document.querySelectorAll('[data-qr-label]').forEach((button) => {
+    button.addEventListener('click', () => handleInventoryQrLabel(button));
+  });
+  document.querySelectorAll('[data-trace-warehouse]').forEach((warehouseSelect) => {
+    const form = warehouseSelect.closest('form');
+    const locationSelect = form?.querySelector('[data-trace-location]');
+    if (!locationSelect) return;
+    const emptyOption = locationSelect.querySelector('option[value=""]')?.cloneNode(true);
+    const updateTraceLocations = () => {
+      const previousLocationId = locationSelect.value;
+      const options = inventoryTransferState.locations
+        .filter((location) => location.warehouse_id === warehouseSelect.value)
+        .map((location) => `<option value="${location.id}">${escapeHtml(location.code)} · ${escapeHtml(location.name)}${location.bin_code ? ` (${escapeHtml(location.bin_code)})` : ''}</option>`)
+        .join('');
+      locationSelect.innerHTML = `${emptyOption?.outerHTML || '<option value="">Any location</option>'}${options}`;
+      if (inventoryTransferState.locations.some((location) => (
+        location.id === previousLocationId && location.warehouse_id === warehouseSelect.value
+      ))) locationSelect.value = previousLocationId;
+    };
+    warehouseSelect.addEventListener('change', updateTraceLocations);
+    updateTraceLocations();
   });
   document.querySelectorAll('[data-inventory-count-form]').forEach((form) => {
     form.addEventListener('submit', handleInventoryCountSubmit);
@@ -3369,6 +3985,7 @@ function render() {
     button.addEventListener('click', () => { hrState.tab = button.dataset.hrTab; render(); });
   });
   document.querySelectorAll('[data-hr-form]').forEach((form) => form.addEventListener('submit', handleHrFormSubmit));
+  bindHrInputRules();
   document.querySelectorAll('[data-hr-edit-employee]').forEach((button) => {
     button.addEventListener('click', () => showEmployeeEditForm(button.dataset.hrEditEmployee));
   });
@@ -3378,6 +3995,10 @@ function render() {
   });
   document.getElementById('hr-attendance-employee')?.addEventListener('change', (event) => {
     hrState.attendanceEmployeeId = event.currentTarget.value;
+    render();
+  });
+  document.getElementById('hr-attendance-month')?.addEventListener('change', (event) => {
+    hrState.attendanceMonth = event.currentTarget.value;
     render();
   });
   document.querySelector('[data-attendance-filters]')?.addEventListener('submit', (event) => {
@@ -3500,16 +4121,16 @@ function showEmployeeEditForm(employeeId) {
   dialog.innerHTML = `<div class="modal-card hr-edit-modal"><div class="modal-header"><div><p class="eyebrow">Employee record</p><h2>Edit ${escapeHtml(hrEmployeeName(employee))}</h2></div><button type="button" class="modal-close">×</button></div><form class="hr-form" data-hr-form="employee-edit" data-employee-id="${escapeHtml(employee.id)}"></form></div>`;
   const form = dialog.querySelector('form');
   const fields = [
-    ['employeeNumber', 'Employee number', employee.employeeNumber],
-    ['firstName', 'First name', employee.personal?.firstName],
-    ['lastName', 'Last name', employee.personal?.lastName],
+    ['employeeNumber', 'Employee number (digits only)', employee.employeeNumber, 'text', 'digits-edit'],
+    ['firstName', 'First name', employee.personal?.firstName, 'text', 'person'],
+    ['lastName', 'Last name', employee.personal?.lastName, 'text', 'person'],
     ['dateOfBirth', 'Date of birth', employee.personal?.dateOfBirth, 'date'],
-    ['gender', 'Gender', employee.personal?.gender],
-    ['nationalId', 'National ID', employee.personal?.nationalId],
+    ['gender', 'Gender', employee.personal?.gender, 'gender'],
+    ['nationalId', 'National ID', employee.personal?.nationalId, 'text', 'national-id-edit'],
     ['address', 'Address', employee.personal?.address],
     ['email', 'Email', employee.contact?.email, 'email'],
     ['phone', 'Phone', employee.contact?.phone, 'tel'],
-    ['emergencyName', 'Emergency contact', employee.emergencyContact?.name],
+    ['emergencyName', 'Emergency contact', employee.emergencyContact?.name, 'text', 'person'],
     ['emergencyPhone', 'Emergency phone', employee.emergencyContact?.phone, 'tel'],
     ['emergencyRelationship', 'Relationship', employee.emergencyContact?.relationship],
     ['hireDate', 'Hire date', employee.hireDate, 'date'],
@@ -3519,7 +4140,9 @@ function showEmployeeEditForm(employeeId) {
     ['advanceDeduction', 'Advance deduction', employee.advanceDeduction || 0, 'number'],
     ['otherDeductions', 'Other deductions', employee.otherDeductions || 0, 'number'],
   ];
-  form.innerHTML = fields.map(([name, label, value, type = 'text']) => hrFormField(label, name, type, null, false, value)).join('')
+  form.innerHTML = fields.map(([name, label, value, type = 'text', validationRule = '']) => type === 'gender'
+    ? hrFormField(label, name, 'text', hrGenderOptions(value), false, value)
+    : hrFormField(label, name, type, null, false, value, validationRule)).join('')
     + hrFormField('Department', 'departmentId', 'text', hrState.workspace.departments.map((item) => [item.id, item.name]), true, employee.departmentId)
     + hrFormField('Position', 'positionId', 'text', hrState.workspace.positions.map((item) => [item.id, item.name]), true, employee.positionId)
     + hrFormField('Employment type', 'employmentType', 'text', [['Full-time', 'Full-time'], ['Part-time', 'Part-time'], ['Contract', 'Contract'], ['Temporary', 'Temporary']], true, employee.employmentType)
@@ -3528,6 +4151,7 @@ function showEmployeeEditForm(employeeId) {
   dialog.querySelector('.modal-close').addEventListener('click', () => dialog.remove());
   dialog.addEventListener('click', (clickEvent) => { if (clickEvent.target === dialog) dialog.remove(); });
   document.body.appendChild(dialog);
+  bindHrInputRules(form);
   form.addEventListener('submit', handleHrFormSubmit);
 }
 

@@ -20,6 +20,80 @@ export async function getAccountingAccounts(client, organizationId) {
   return result.rows;
 }
 
+export async function getAccountingBudgetWorkspace(client, organizationId) {
+  const result = await client.query(
+    `SELECT budget.id AS budget_id, budget.budget_code, budget.budget_name,
+            budget.fiscal_year, budget.status AS budget_status,
+            line.id AS line_id, line.period_start, line.account_id,
+            account.account_code, account.account_name, account.account_type,
+            line.cost_center_code, line.profit_center_code, line.budget_amount,
+            COALESCE(actual.actual_amount, 0) AS actual_amount,
+            line.budget_amount - COALESCE(actual.actual_amount, 0) AS variance
+     FROM accounting_budgets budget
+     LEFT JOIN accounting_budget_lines line
+       ON line.budget_id = budget.id AND line.organization_id = budget.organization_id
+     LEFT JOIN accounting_accounts account
+       ON account.id = line.account_id AND account.organization_id = budget.organization_id
+     LEFT JOIN LATERAL (
+       SELECT SUM(CASE WHEN account.normal_balance = 'DEBIT'
+                       THEN journal_line.debit - journal_line.credit
+                       ELSE journal_line.credit - journal_line.debit END) AS actual_amount
+       FROM accounting_journals journal
+       JOIN accounting_journal_lines journal_line ON journal_line.journal_id = journal.id
+       WHERE journal.organization_id = budget.organization_id
+         AND journal.status = 'POSTED'
+         AND journal.transaction_date >= line.period_start
+         AND journal.transaction_date < (line.period_start + INTERVAL '1 month')
+         AND journal_line.account_id = line.account_id
+         AND COALESCE(journal_line.cost_center, '') = line.cost_center_code
+         AND COALESCE(journal_line.profit_center, '') = line.profit_center_code
+     ) actual ON line.id IS NOT NULL
+     WHERE budget.organization_id = $1
+     ORDER BY budget.fiscal_year DESC, line.period_start, account.account_code,
+              line.cost_center_code, line.profit_center_code`,
+    [organizationId],
+  );
+  return result.rows;
+}
+
+export async function saveAccountingBudgetLine(client, organizationId, actorId, input) {
+  const budgetResult = await client.query(
+    `INSERT INTO accounting_budgets (organization_id, budget_code, budget_name, fiscal_year, created_by)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (organization_id, fiscal_year) DO UPDATE
+       SET budget_code = EXCLUDED.budget_code, budget_name = EXCLUDED.budget_name,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE accounting_budgets.status = 'ACTIVE'
+     RETURNING id, budget_code, budget_name, fiscal_year, status`,
+    [organizationId, input.budgetCode, input.budgetName, input.fiscalYear, actorId],
+  );
+  if (!budgetResult.rows[0]) throw new Error('A closed budget cannot be changed.');
+
+  const result = await client.query(
+    `INSERT INTO accounting_budget_lines (
+       organization_id, budget_id, account_id, period_start,
+       cost_center_code, profit_center_code, budget_amount
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (budget_id, account_id, period_start, cost_center_code, profit_center_code)
+     DO UPDATE SET budget_amount = EXCLUDED.budget_amount, updated_at = CURRENT_TIMESTAMP
+     RETURNING *`,
+    [
+      organizationId, budgetResult.rows[0].id, input.accountId, input.periodStart,
+      input.costCenterCode, input.profitCenterCode, input.amount,
+    ],
+  );
+  await recordAccountingAudit(client, organizationId, actorId, 'accounting_budget_line_saved', result.rows[0].id, {
+    budgetCode: budgetResult.rows[0].budget_code,
+    fiscalYear: budgetResult.rows[0].fiscal_year,
+    accountId: input.accountId,
+    periodStart: input.periodStart,
+    costCenterCode: input.costCenterCode || null,
+    profitCenterCode: input.profitCenterCode || null,
+    budgetAmount: input.amount,
+  }, 'accounting_budget_line');
+  return result.rows[0];
+}
+
 export async function getAccountingAccount(client, organizationId, accountId) {
   const result = await client.query(
     `SELECT ${ACCOUNT_COLUMNS} FROM accounting_accounts
@@ -140,10 +214,11 @@ export async function createAccountingPeriod(client, organizationId, actorId, in
 
 export async function getOrCreateAccountingPeriod(client, organizationId, actorId, date = new Date()) {
   const transactionDate = new Date(date);
-  const fiscalYear = transactionDate.getFullYear();
-  const periodNumber = transactionDate.getMonth() + 1;
-  const periodStart = new Date(Date.UTC(fiscalYear, periodNumber - 1, 1));
-  const periodEnd = new Date(Date.UTC(fiscalYear, periodNumber, 0));
+  const dateOnly = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date);
+  const fiscalYear = dateOnly ? Number(date.slice(0, 4)) : transactionDate.getUTCFullYear();
+  const periodNumber = dateOnly ? Number(date.slice(5, 7)) : transactionDate.getUTCMonth() + 1;
+  const periodStart = `${fiscalYear}-${String(periodNumber).padStart(2, '0')}-01`;
+  const periodEnd = new Date(Date.UTC(fiscalYear, periodNumber, 0)).toISOString().slice(0, 10);
   const periodResult = await client.query(
     `SELECT id, fiscal_year, period_number, status FROM accounting_periods
      WHERE organization_id = $1 AND fiscal_year = $2 AND period_number = $3
@@ -193,9 +268,11 @@ export async function closeAccountingPeriod(client, organizationId, actorId, per
 }
 
 export async function createAccountingJournal(client, organizationId, actorId, input) {
-  const transactionDate = new Date(input.transactionDate);
+  const transactionDate = input.transactionDate instanceof Date
+    ? input.transactionDate.toISOString().slice(0, 10)
+    : String(input.transactionDate).slice(0, 10);
   const period = await getOrCreateAccountingPeriod(client, organizationId, actorId, transactionDate);
-  const fiscalYear = Number(period.fiscal_year ?? period.fiscalYear ?? transactionDate.getFullYear());
+  const fiscalYear = Number(period.fiscal_year ?? period.fiscalYear ?? transactionDate.slice(0, 4));
   await client.query(
     `INSERT INTO accounting_journal_sequences (organization_id, fiscal_year, next_number)
      VALUES ($1, $2, 1)
@@ -266,7 +343,7 @@ export async function getJournalLines(client, journalId) {
   const result = await client.query(
     `SELECT line.id, line.journal_id, line.account_id, account.account_code,
             account.account_name, line.line_number, line.debit, line.credit,
-            line.description, line.cost_center, line.created_at
+           line.description, line.cost_center, line.profit_center, line.created_at
      FROM accounting_journal_lines line
      JOIN accounting_accounts account ON account.id = line.account_id
      WHERE line.journal_id = $1
@@ -396,7 +473,7 @@ export async function reverseAccountingJournal(client, organizationId, actorId, 
   if (!journal || journal.status !== 'POSTED') return null;
   if (journal.period_status === 'CLOSED') throw new Error('The accounting period is closed.');
   const reversalLines = await client.query(
-    `SELECT account_id, credit AS debit, debit AS credit, description, cost_center
+    `SELECT account_id, credit AS debit, debit AS credit, description, cost_center, profit_center
      FROM accounting_journal_lines
      WHERE journal_id = $1`,
     [journalId],
@@ -441,10 +518,10 @@ export async function reverseAccountingJournal(client, organizationId, actorId, 
   for (const [index, line] of reversalLines.rows.entries()) {
     await client.query(
       `INSERT INTO accounting_journal_lines (
-        journal_id, account_id, line_number, debit, credit, description, cost_center,
+        journal_id, account_id, line_number, debit, credit, description, cost_center, profit_center,
         created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
-      [reversal.rows[0].id, line.account_id, index + 1, toNumber(line.debit), toNumber(line.credit), line.description, line.cost_center],
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
+      [reversal.rows[0].id, line.account_id, index + 1, toNumber(line.debit), toNumber(line.credit), line.description, line.cost_center, line.profit_center],
     );
   }
   await client.query(
@@ -474,7 +551,7 @@ export async function getAccountingLedger(client, organizationId, accountId) {
   const query = accountId
     ? `SELECT j.journal_number, j.transaction_date, j.reference, j.description,
               jl.line_number, jl.debit, jl.credit, jl.description AS line_description,
-              jl.cost_center, j.status, j.source_module, j.source_transaction_id,
+              jl.cost_center, jl.profit_center, j.status, j.source_module, j.source_transaction_id,
               j.created_at, j.posted_at
         FROM accounting_journal_lines jl
         JOIN accounting_journals j ON j.id = jl.journal_id
@@ -483,7 +560,7 @@ export async function getAccountingLedger(client, organizationId, accountId) {
         ORDER BY j.transaction_date, j.journal_number, jl.line_number`
     : `SELECT j.journal_number, j.transaction_date, j.reference, j.description,
               jl.line_number, jl.debit, jl.credit, jl.description AS line_description,
-              jl.cost_center, j.status, j.source_module, j.source_transaction_id,
+              jl.cost_center, jl.profit_center, j.status, j.source_module, j.source_transaction_id,
               j.created_at, j.posted_at
         FROM accounting_journal_lines jl
         JOIN accounting_journals j ON j.id = jl.journal_id
@@ -634,9 +711,9 @@ async function insertJournalLines(client, journalId, lines, organizationId) {
     if (!account.rows[0]) throw new Error('Journal account must be active and belong to the current organization.');
     await client.query(
       `INSERT INTO accounting_journal_lines (
-        journal_id, account_id, line_number, debit, credit, description, cost_center, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
-      [journalId, line.accountId, index + 1, debit, credit, line.description.trim(), line.costCenter || null],
+        journal_id, account_id, line_number, debit, credit, description, cost_center, profit_center, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)`,
+      [journalId, line.accountId, index + 1, debit, credit, line.description.trim(), line.costCenter || null, line.profitCenter || null],
     );
   }
 }

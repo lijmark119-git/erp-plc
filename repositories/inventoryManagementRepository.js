@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isValidBusinessCode } from '../validation.js';
 
 const PRODUCT_COLUMNS = `
   id, organization_id, sku, product_code, barcode, name, description, category,
@@ -25,8 +26,55 @@ function normalizeAmount(value) {
 }
 
 function normalizeRequired(value, field) {
-  if (value === undefined || value === null || value === '') throw new Error(`${field} is required.`);
-  return value;
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required.`);
+  return value.trim();
+}
+
+function normalizeOptionalCode(value, field, maxLength) {
+  if (value === undefined || value === null || value === '') return null;
+  if (!isValidBusinessCode(value, maxLength)) throw new Error(`${field} must be a valid code.`);
+  return value.trim();
+}
+
+function normalizeProductAmount(value, field, allowZero = true) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0 || (!allowZero && number === 0)) {
+    throw new Error(`${field} must be a ${allowZero ? 'non-negative' : 'positive'} number.`);
+  }
+  return Math.round(number * 1_000_000) / 1_000_000;
+}
+
+function normalizeProductInput(input) {
+  const sku = normalizeRequired(input.sku, 'sku');
+  const name = normalizeRequired(input.name, 'name');
+  const productType = normalizeRequired(input.productType, 'productType');
+  const valuationMethod = input.valuationMethod || 'FIFO';
+  if (!isValidBusinessCode(sku, 80)) throw new Error('sku must be a valid code of up to 80 characters.');
+  if (name.length > 240) throw new Error('name must be 240 characters or fewer.');
+  if (!['RAW_MATERIAL', 'FINISHED_GOOD', 'SEMI_FINISHED_GOOD', 'TRADING_PRODUCT', 'CONSUMABLE', 'SPARE_PART', 'SERVICE'].includes(productType)) {
+    throw new Error('productType is invalid.');
+  }
+  if (!['FIFO', 'WEIGHTED_AVERAGE'].includes(valuationMethod)) throw new Error('valuationMethod is invalid.');
+  const values = {
+    sku,
+    productCode: normalizeOptionalCode(input.productCode, 'productCode', 80),
+    barcode: normalizeOptionalCode(input.barcode, 'barcode', 128),
+    name,
+    productType,
+    unitOfMeasureId: normalizeRequired(input.unitOfMeasureId, 'unitOfMeasureId'),
+    purchasePrice: normalizeProductAmount(input.purchasePrice ?? 0, 'purchasePrice'),
+    salesPrice: normalizeProductAmount(input.salesPrice ?? 0, 'salesPrice'),
+    standardCost: normalizeProductAmount(input.standardCost ?? 0, 'standardCost'),
+    minimumStock: normalizeProductAmount(input.minimumStock ?? 0, 'minimumStock'),
+    maximumStock: normalizeProductAmount(input.maximumStock ?? 0, 'maximumStock'),
+    reorderLevel: normalizeProductAmount(input.reorderLevel ?? 0, 'reorderLevel'),
+    reorderQuantity: normalizeProductAmount(input.reorderQuantity ?? 1, 'reorderQuantity', false),
+    valuationMethod,
+  };
+  if (values.maximumStock > 0 && values.maximumStock < values.minimumStock) {
+    throw new Error('maximumStock cannot be lower than minimumStock.');
+  }
+  return values;
 }
 
 export async function getInventoryProducts(client, organizationId, activeOnly = false) {
@@ -62,6 +110,7 @@ export async function getInventoryProductBySku(client, organizationId, sku) {
 }
 
 export async function createInventoryProduct(client, organizationId, actorId, input) {
+  const values = normalizeProductInput(input);
   const product = await client.query(
     `INSERT INTO inventory_products (
       organization_id, sku, product_code, barcode, name, description, category,
@@ -76,29 +125,29 @@ export async function createInventoryProduct(client, organizationId, actorId, in
      RETURNING ${PRODUCT_COLUMNS}`,
     [
       organizationId,
-      normalizeRequired(input.sku, 'sku').trim(),
-      input.productCode?.trim() || null,
-      input.barcode?.trim() || null,
-      normalizeRequired(input.name, 'name').trim(),
+      values.sku,
+      values.productCode,
+      values.barcode,
+      values.name,
       input.description?.trim() || null,
       input.category?.trim() || null,
       input.brand?.trim() || null,
-      normalizeRequired(input.productType, 'productType'),
-      input.unitOfMeasureId,
-      normalizeAmount(input.purchasePrice ?? 0),
-      normalizeAmount(input.salesPrice ?? 0),
-      normalizeAmount(input.standardCost ?? 0),
+      values.productType,
+      values.unitOfMeasureId,
+      values.purchasePrice,
+      values.salesPrice,
+      values.standardCost,
       input.taxCategory || 'STANDARD',
-      normalizeAmount(input.minimumStock ?? 0),
-      normalizeAmount(input.maximumStock ?? 0),
-      normalizeAmount(input.reorderLevel ?? 0),
-      normalizeAmount(input.reorderQuantity ?? 0),
+      values.minimumStock,
+      values.maximumStock,
+      values.reorderLevel,
+      values.reorderQuantity,
       input.inventoryAccountCode || '1200',
       input.cogsAccountCode || '5000',
       input.wipAccountCode || '1300',
       input.finishedGoodsAccountCode || '1400',
       input.grniAccountCode || '2000',
-      input.valuationMethod || 'FIFO',
+      values.valuationMethod,
       input.active !== false,
       actorId,
     ],
@@ -108,6 +157,7 @@ export async function createInventoryProduct(client, organizationId, actorId, in
 }
 
 export async function updateInventoryProduct(client, organizationId, actorId, productId, input) {
+  const values = normalizeProductInput(input);
   const result = await client.query(
     `UPDATE inventory_products SET
       sku = $1, product_code = $2, barcode = $3, name = $4, description = $5,
@@ -121,16 +171,16 @@ export async function updateInventoryProduct(client, organizationId, actorId, pr
      WHERE organization_id = $25 AND id = $26
      RETURNING ${PRODUCT_COLUMNS}`,
     [
-      input.sku, input.productCode?.trim() || null, input.barcode?.trim() || null,
-      input.name, input.description?.trim() || null, input.category?.trim() || null,
-      input.brand?.trim() || null, input.productType, input.unitOfMeasureId,
-      normalizeAmount(input.purchasePrice ?? 0), normalizeAmount(input.salesPrice ?? 0),
-      normalizeAmount(input.standardCost ?? 0), input.taxCategory || 'STANDARD',
-      normalizeAmount(input.minimumStock ?? 0), normalizeAmount(input.maximumStock ?? 0),
-      normalizeAmount(input.reorderLevel ?? 0), normalizeAmount(input.reorderQuantity ?? 0),
+      values.sku, values.productCode, values.barcode,
+      values.name, input.description?.trim() || null, input.category?.trim() || null,
+      input.brand?.trim() || null, values.productType, values.unitOfMeasureId,
+      values.purchasePrice, values.salesPrice,
+      values.standardCost, input.taxCategory || 'STANDARD',
+      values.minimumStock, values.maximumStock,
+      values.reorderLevel, values.reorderQuantity,
       input.inventoryAccountCode || '1200', input.cogsAccountCode || '5000',
       input.wipAccountCode || '1300', input.finishedGoodsAccountCode || '1400',
-      input.grniAccountCode || '2000', input.valuationMethod || 'FIFO', input.active !== false,
+      input.grniAccountCode || '2000', values.valuationMethod, input.active !== false,
       organizationId, productId,
     ],
   );

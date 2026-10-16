@@ -50,6 +50,9 @@ const sellerPassword = process.env.SELLER_PASSWORD || 'seller123';
 
 async function cleanSalesFixture() {
   if (customerId) {
+    await client.query('DELETE FROM sales_receivable_disputes WHERE organization_id=$1 AND receivable_id IN (SELECT id FROM accounts_receivable WHERE customer_id=$2)', [organizationId, customerId]);
+    await client.query('DELETE FROM sales_customer_activities WHERE organization_id=$1 AND (customer_id=$2 OR crm_record_id IN (SELECT id FROM sales_crm_records WHERE customer_id=$2))', [organizationId, customerId]);
+    await client.query('DELETE FROM sales_crm_records WHERE organization_id=$1 AND customer_id=$2', [organizationId, customerId]);
     await client.query('DELETE FROM sales_audit_trail WHERE organization_id=$1 AND entity_id IN (SELECT id FROM quotations WHERE customer_id=$2 UNION SELECT id FROM sales_orders WHERE customer_id=$2 UNION SELECT id FROM delivery_notes WHERE customer_id=$2 UNION SELECT id FROM customer_invoices WHERE customer_id=$2 UNION SELECT id FROM customer_payments WHERE customer_id=$2 UNION SELECT id FROM customers WHERE id=$2)', [organizationId, customerId]);
     await client.query('DELETE FROM invoice_lines WHERE invoice_id IN (SELECT id FROM customer_invoices WHERE customer_id=$1)', [customerId]);
     await client.query('DELETE FROM accounts_receivable WHERE customer_id=$1', [customerId]);
@@ -113,19 +116,35 @@ test('sales quote-to-cash workflow posts inventory, invoice, payment, reports, a
     transactionType: 'PURCHASE_RECEIPT', referenceType: 'SALES_TEST', referenceId: references[0],
   });
 
+  const customerInput = {
+    customerCode: `C-${suffix}`, legalName: `Sales customer ${suffix}`, contactPerson: 'Test Contact',
+    phone: '+251900000000', email: `${suffix}@example.test`, taxId: `T-${suffix}`,
+    creditLimit: 10000, paymentTerms: '30 days', currency: 'ETB',
+    addresses: [{ addressType: 'billing', addressLine: 'Billing Street', city: 'Addis Ababa' }, { addressType: 'delivery', addressLine: 'Delivery Street', city: 'Addis Ababa' }],
+  };
+  const invalidCustomer = await request('POST', '/api/sales/customers', {
+    body: JSON.stringify({ ...customerInput, customerCode: `INVALID-${suffix}`, phone: 'phone123' }),
+  }, adminCookie);
+  assert.equal(invalidCustomer.status, 400);
   const customer = await request('POST', '/api/sales/customers', {
-    body: JSON.stringify({
-      customerCode: `C-${suffix}`, legalName: `Sales customer ${suffix}`, contactPerson: 'Test Contact',
-      phone: '+251900000000', email: `${suffix}@example.test`, taxId: `T-${suffix}`,
-      creditLimit: 10000, paymentTerms: '30 days', currency: 'ETB',
-      addresses: [{ addressType: 'billing', addressLine: 'Billing Street', city: 'Addis Ababa' }, { addressType: 'delivery', addressLine: 'Delivery Street', city: 'Addis Ababa' }],
-    }),
+    body: JSON.stringify(customerInput),
   }, adminCookie);
   assert.equal(customer.status, 201);
   customerId = customer.body.id;
   const addresses = await request('GET', `/api/sales/customers/${customerId}/addresses`, {}, adminCookie);
   assert.equal(addresses.status, 200);
   assert.equal(addresses.body.length, 2);
+  const crmRecord = await request('POST', '/api/sales/crm', {
+    body: JSON.stringify({ recordType: 'OPPORTUNITY', name: `Opportunity ${suffix}`, customerId, stage: 'QUALIFIED', estimatedValue: 1500 }),
+  }, adminCookie);
+  assert.equal(crmRecord.status, 201);
+  const crmActivity = await request('POST', '/api/sales/activities', {
+    body: JSON.stringify({ crmRecordId: crmRecord.body.id, activityType: 'CALL', subject: 'Discovery call', nextFollowUp: new Date(Date.now() + 86400000).toISOString().slice(0, 10) }),
+  }, adminCookie);
+  assert.equal(crmActivity.status, 201);
+  const crmWorkspace = await request('GET', '/api/sales/crm', {}, adminCookie);
+  assert.ok(crmWorkspace.body.records.some((record) => record.id === crmRecord.body.id));
+  assert.ok(crmWorkspace.body.activities.some((activity) => activity.id === crmActivity.body.id));
 
   const line = { productSku: product.sku, productName: product.name, quantity: 4, unitPrice: 120, discountPercent: 10, taxPercent: 15 };
   const held = await request('POST', `/api/sales/customers/${customerId}/credit-hold`, {
@@ -207,6 +226,21 @@ test('sales quote-to-cash workflow posts inventory, invoice, payment, reports, a
   assert.equal(issued.status, 200);
   const invoiceJournal = await client.query("SELECT j.id FROM accounting_journals j WHERE j.organization_id=$1 AND j.source_module='sales' AND j.source_transaction_id=$2", [organizationId, `invoice:${invoiceId}`]);
   assert.ok(invoiceJournal.rows[0]);
+  const invoiceReceivable = (await client.query('SELECT id FROM accounts_receivable WHERE invoice_id=$1 AND organization_id=$2', [invoiceId, organizationId])).rows[0];
+  const dispute = await request('POST', '/api/sales/disputes', {
+    body: JSON.stringify({ receivableId: invoiceReceivable.id, reason: 'Quantity under review' }),
+  }, adminCookie);
+  assert.equal(dispute.status, 201);
+  const disputeReview = await request('POST', `/api/sales/disputes/${dispute.body.id}/status`, {
+    body: JSON.stringify({ status: 'UNDER_REVIEW' }),
+  }, adminCookie);
+  assert.equal(disputeReview.status, 200);
+  const disputeResolve = await request('POST', `/api/sales/disputes/${dispute.body.id}/status`, {
+    body: JSON.stringify({ status: 'RESOLVED', resolution: 'Confirmed invoice quantity' }),
+  }, adminCookie);
+  assert.equal(disputeResolve.status, 200);
+  assert.equal(disputeResolve.body.status, 'RESOLVED');
+  assert.equal((await request('GET', '/api/sales/disputes', {}, adminCookie)).body.some((item) => item.id === dispute.body.id), true);
 
   const payment = await request('POST', '/api/sales/payments', {
     body: JSON.stringify({ invoiceId, amount: Number(invoice.body.total), paymentMethod: 'bank', referenceNumber: `BANK-${suffix}` }),

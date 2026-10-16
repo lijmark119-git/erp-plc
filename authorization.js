@@ -34,6 +34,7 @@ export const DEFAULT_ROLE_PERMISSIONS = Object.freeze({
     'sales:receivables:read',
     'sales:reports:read',
     'accounting:reports:view',
+    'accounting:budgets:manage',
     'accounting:accounts:manage',
     'accounting:periods:manage',
     'accounting:journals:create',
@@ -79,6 +80,8 @@ export const DEFAULT_ROLE_PERMISSIONS = Object.freeze({
     'hr:payroll:report',
     'settings:toggle',
     'users:manage',
+    'governance:read',
+    'governance:manage',
     'audit:read',
   ]),
   MANAGER: new Set([
@@ -145,6 +148,7 @@ export const DEFAULT_ROLE_PERMISSIONS = Object.freeze({
     'hr:payroll:calculate',
     'hr:payroll:approve',
     'hr:payroll:report',
+    'governance:read',
     'audit:read',
   ]),
   SALES_USER: new Set([
@@ -183,6 +187,7 @@ export const DEFAULT_ROLE_PERMISSIONS = Object.freeze({
   ]),
   FINANCE_USER: new Set([
     'accounting:reports:view',
+    'accounting:budgets:manage',
     'accounting:accounts:manage',
     'accounting:periods:manage',
     'accounting:journals:create',

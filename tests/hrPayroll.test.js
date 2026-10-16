@@ -141,22 +141,49 @@ test('HR employee and attendance flows work end-to-end', async (t) => {
   const cookie = getCookieFromLogin(adminLogin);
   assert.equal(adminLogin.status, 200);
 
-  const employee = await request(server, 'POST', '/api/employees', {
-    body: JSON.stringify({
-      employeeNumber: 'EMP-2026-CA-001',
-      firstName: 'Selam',
-      lastName: 'Tesfaye',
-      departmentId: 'dept-hr',
-      positionId: 'pos-hr',
-      employmentType: 'Full-time',
-      hireDate: '2026-09-01',
-      contract: 'Permanent',
-      salary: 26000,
-      status: 'Active',
-    }),
+  const employeeInput = {
+    employeeNumber: '20260001',
+    firstName: 'Selam',
+    lastName: 'Tesfaye',
+    gender: 'Female',
+    nationalId: '123456789012',
+    departmentId: 'dept-hr',
+    positionId: 'pos-hr',
+    employmentType: 'Full-time',
+    hireDate: '2026-09-01',
+    contract: 'Permanent',
+    salary: 26000,
+    status: 'Active',
+  };
+  const invalidPhone = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify({ ...employeeInput, employeeNumber: '20260002', phone: '091ABC5678' }),
   }, cookie);
-  assert.equal(employee.status, 201);
-  assert.equal(employee.body.employeeNumber, 'EMP-2026-CA-001');
+  assert.equal(invalidPhone.status, 400);
+  const invalidEmployeeNumber = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify({ ...employeeInput, employeeNumber: 'EMP-2026-CA-002' }),
+  }, cookie);
+  assert.equal(invalidEmployeeNumber.status, 400);
+  const invalidEmployeeName = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify({ ...employeeInput, employeeNumber: '20260003', firstName: 'Selam2' }),
+  }, cookie);
+  assert.equal(invalidEmployeeName.status, 400);
+  const invalidGender = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify({ ...employeeInput, employeeNumber: '20260005', gender: '7' }),
+  }, cookie);
+  assert.equal(invalidGender.status, 400);
+  const invalidNationalId = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify({ ...employeeInput, employeeNumber: '20260006', nationalId: 'NID-123456' }),
+  }, cookie);
+  assert.equal(invalidNationalId.status, 400);
+  const invalidDate = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify({ ...employeeInput, employeeNumber: '20260004', hireDate: '2026-02-30' }),
+  }, cookie);
+  assert.equal(invalidDate.status, 400);
+  const employee = await request(server, 'POST', '/api/employees', {
+    body: JSON.stringify(employeeInput),
+  }, cookie);
+  assert.equal(employee.status, 201, JSON.stringify(employee.body));
+  assert.equal(employee.body.employeeNumber, '20260001');
 
   const checkIn = await request(server, 'POST', `/api/hr/attendance/check-in/${employee.body.id}`, {}, cookie);
   assert.equal(checkIn.status, 201);

@@ -51,6 +51,10 @@ test('ADMIN can create, edit, and delete a sales order', async (t) => {
   assert.equal(create.body.customer, 'CRUD Test Customer');
 
   const id = create.body.id;
+  const invalidDateUpdate = await request(server, 'PUT', `/api/sales/${id}`, {
+    body: JSON.stringify({ date: '2026-02-30' }),
+  }, cookie);
+  assert.equal(invalidDateUpdate.status, 400);
   const update = await request(server, 'PUT', `/api/sales/${id}`, {
     body: JSON.stringify({ customer: 'CRUD Test Customer Updated', date: '2026-10-02', amount: 135.75, status: 'Processing' }),
   }, cookie);

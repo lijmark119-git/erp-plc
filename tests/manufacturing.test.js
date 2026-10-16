@@ -16,11 +16,14 @@ const cleanup = {
   lotIds: [], transactionIds: [], journalIds: [], supplyIds: [], runIds: [], uomIds: [],
   deliveryIds: [], salesOrderIds: [], customerIds: [],
   qualityInspectionIds: [],
+  forecastIds: [], maintenanceIds: [],
 };
 
 after(async () => {
   try {
     await client.query('BEGIN');
+    if (cleanup.maintenanceIds.length) await client.query('DELETE FROM manufacturing_maintenance_events WHERE id=ANY($1::uuid[])', [cleanup.maintenanceIds]);
+    if (cleanup.forecastIds.length) await client.query('DELETE FROM manufacturing_demand_forecasts WHERE id=ANY($1::uuid[])', [cleanup.forecastIds]);
     if (cleanup.journalIds.length) {
       const ids = (await client.query(
         'SELECT id FROM accounting_journals WHERE organization_id=$1 AND id=ANY($2::uuid[])',
@@ -115,6 +118,28 @@ test('manufacturing plans, reserves, consumes, costs, completes, and traces prod
   });
   cleanup.bomIds.push(bom.id);
   await manufacturingService.activateBom(client, organizationId, actorId, bom.id);
+  const forecast = await manufacturingService.createDemandForecast(client, organizationId, actorId, {
+    productId: finished.id, forecastDate: new Date().toISOString().slice(0, 10), quantity: 5, notes: 'Test forecast',
+  });
+  cleanup.forecastIds.push(forecast.id);
+  const forecastMrp = await manufacturingService.runMrp(client, organizationId, actorId, {
+    planningDate: new Date().toISOString().slice(0, 10),
+    endDate: new Date().toISOString().slice(0, 10),
+    demandSource: 'FORECAST',
+  });
+  cleanup.runIds.push(forecastMrp.id);
+  assert.equal(forecastMrp.demands[0].quantity, 5);
+  assert.equal(forecastMrp.demand_source, 'FORECAST');
+  const maintenance = await manufacturingService.createMaintenanceEvent(client, organizationId, actorId, {
+    workCenterId: center.id, maintenanceType: 'PREVENTIVE', description: 'Test scheduled service',
+    scheduledDate: new Date().toISOString().slice(0, 10),
+  });
+  cleanup.maintenanceIds.push(maintenance.id);
+  const completedMaintenance = await manufacturingService.completeMaintenanceEvent(
+    client, organizationId, actorId, maintenance.id, 45,
+  );
+  assert.equal(completedMaintenance.status, 'COMPLETED');
+  assert.equal(Number(completedMaintenance.downtime_minutes), 45);
   const routing = await manufacturingService.createRouting(client, organizationId, actorId, {
     routingCode: `RT-${suffix}`, version: 'A', finishedProductId: finished.id, effectiveFrom: new Date().toISOString().slice(0, 10),
     operations: [{ sequenceNumber: 10, operationName: 'Assembly', workCenterId: center.id, setupMinutes: 0, machineMinutesPerUnit: 6, laborHoursPerUnit: 0.05 }],

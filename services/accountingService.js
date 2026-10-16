@@ -8,6 +8,7 @@ import {
   createAutomaticJournal,
   getAccountingAccount,
   getAccountingAccountByCode,
+  getAccountingBudgetWorkspace,
   getAccountingAccounts,
   getAccountingBalance,
   getAccountingJournal,
@@ -18,9 +19,11 @@ import {
   getTrialBalance,
   postAccountingJournal,
   reverseAccountingJournal,
+  saveAccountingBudgetLine,
   submitAccountingJournal,
   updateAccountingAccount,
 } from '../repositories/accountingRepository.js';
+import { isValidISODate } from '../validation.js';
 
 const JOURNAL_STATUSES = new Set(['DRAFT', 'SUBMITTED', 'APPROVED', 'POSTED', 'REVERSED', 'CANCELLED']);
 const ACCOUNT_TYPES = new Set(['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'COGS', 'OPERATING_EXPENSE', 'OTHER_INCOME', 'OTHER_EXPENSE']);
@@ -29,6 +32,60 @@ const NORMAL_BALANCES = new Set(['DEBIT', 'CREDIT']);
 export const accountingService = {
   async getAccounts(client, organizationId) {
     return getAccountingAccounts(client, organizationId);
+  },
+
+  async getBudgetWorkspace(client, organizationId) {
+    return getAccountingBudgetWorkspace(client, organizationId);
+  },
+
+  async saveBudgetLine(client, organizationId, actorId, input) {
+    const budgetCode = String(input?.budgetCode || '').trim().toUpperCase();
+    const budgetName = String(input?.budgetName || '').trim();
+    const fiscalYear = Number(input?.fiscalYear);
+    const periodStart = String(input?.periodStart || '');
+    const amount = Number(input?.amount);
+    if (!/^[A-Z0-9][A-Z0-9_-]{1,39}$/.test(budgetCode) || !budgetName || budgetName.length > 160) {
+      throw new Error('A valid budget code and name of up to 160 characters are required.');
+    }
+    if (!Number.isInteger(fiscalYear) || fiscalYear < 2000 || fiscalYear > 9999 ||
+      !/^\d{4}-\d{2}-01$/.test(periodStart) || !isValidISODate(periodStart) ||
+      Number(periodStart.slice(0, 4)) !== fiscalYear) {
+      throw new Error('Choose a valid month within the selected fiscal year.');
+    }
+    if (!Number.isFinite(amount) || amount < 0 || amount > 9999999999999999) {
+      throw new Error('Budget amount must be a non-negative finite number.');
+    }
+    const accountId = String(input?.accountId || '');
+    const account = await getAccountingAccount(client, organizationId, accountId);
+    if (!account || !account.active) throw new Error('Select an active account belonging to this organization.');
+    const costCenterCode = String(input?.costCenterCode || '').trim().toUpperCase();
+    const profitCenterCode = String(input?.profitCenterCode || '').trim().toUpperCase();
+    if (costCenterCode) {
+      const center = await client.query(
+        `SELECT 1 FROM enterprise_cost_centers
+         WHERE organization_id = $1 AND code = $2 AND status = 'ACTIVE'`,
+        [organizationId, costCenterCode],
+      );
+      if (!center.rows[0]) throw new Error('Cost center must be active and belong to this organization.');
+    }
+    if (profitCenterCode) {
+      const center = await client.query(
+        `SELECT 1 FROM enterprise_profit_centers
+         WHERE organization_id = $1 AND code = $2 AND status = 'ACTIVE'`,
+        [organizationId, profitCenterCode],
+      );
+      if (!center.rows[0]) throw new Error('Profit center must be active and belong to this organization.');
+    }
+    return saveAccountingBudgetLine(client, organizationId, actorId, {
+      budgetCode,
+      budgetName,
+      fiscalYear,
+      periodStart,
+      amount: Math.round(amount * 100) / 100,
+      accountId,
+      costCenterCode,
+      profitCenterCode,
+    });
   },
 
   async createAccount(client, organizationId, actorId, input) {
@@ -344,7 +401,14 @@ function validateJournalInput(input) {
   if (input.status && !JOURNAL_STATUSES.has(String(input.status).toUpperCase())) {
     throw new Error('Invalid journal status.');
   }
-  if (Number.isNaN(new Date(input.transactionDate).valueOf())) throw new Error('transactionDate must be a valid date.');
+  const transactionDate = input.transactionDate;
+  const dateText = transactionDate instanceof Date ? transactionDate.toISOString() : transactionDate;
+  const datePart = typeof dateText === 'string' ? dateText.slice(0, 10) : '';
+  const validTimestamp = typeof dateText === 'string' && dateText.length > 10 && Number.isFinite(Date.parse(dateText));
+  if (!(transactionDate instanceof Date && Number.isFinite(transactionDate.valueOf())) &&
+    !isValidISODate(dateText) && !(isValidISODate(datePart) && validTimestamp)) {
+    throw new Error('transactionDate must be a valid calendar date in YYYY-MM-DD format.');
+  }
   if (input.currency && !/^[A-Z]{3}$/.test(String(input.currency).toUpperCase())) throw new Error('currency must be a three-letter ISO code.');
   const lineAccountIds = new Set();
   for (const line of input.lines) {

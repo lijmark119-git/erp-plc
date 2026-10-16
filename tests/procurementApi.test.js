@@ -36,6 +36,8 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
   const createdSupplierIds = [];
   let comparisonId;
   let orderId;
+  let requisitionId;
+  let supplierInvoiceId;
 
   try {
     const cookie = await login(baseUrl);
@@ -44,8 +46,11 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
       supplierCode: `TST-A-${suffix}`,
       name: `Test Supplier A ${suffix}`,
       paymentTerms: 'Net 30',
+      qualificationStatus: 'QUALIFIED',
+      riskLevel: 'LOW',
     });
     assert.equal(supplierOne.response.status, 201);
+    assert.equal(supplierOne.body.qualification_status, 'QUALIFIED');
     createdSupplierIds.push(supplierOne.body.id);
 
     const supplierTwo = await request(baseUrl, cookie, '/api/procurement/suppliers', 'POST', {
@@ -55,6 +60,20 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     });
     assert.equal(supplierTwo.response.status, 201);
     createdSupplierIds.push(supplierTwo.body.id);
+
+    const overBudget = await request(baseUrl, cookie, '/api/procurement/requisitions', 'POST', {
+      title: 'Over budget request', description: 'Budget guard test', quantity: 5, estimatedUnitCost: 100, budgetLimit: 400,
+    });
+    assert.equal(overBudget.response.status, 409);
+    const requisition = await request(baseUrl, cookie, '/api/procurement/requisitions', 'POST', {
+      title: `Test request ${suffix}`, description: 'Budget validated requisition', quantity: 5, estimatedUnitCost: 100, budgetLimit: 500,
+    });
+    assert.equal(requisition.response.status, 201, requisition.body.error);
+    requisitionId = requisition.body.id;
+    const requisitionDecision = await request(baseUrl, cookie, `/api/procurement/requisitions/${requisitionId}/decision`, 'POST', {
+      decision: 'APPROVED', reason: 'Within approved budget',
+    });
+    assert.equal(requisitionDecision.response.status, 200, requisitionDecision.body.error);
 
     const sellerLogin = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
@@ -112,6 +131,14 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     });
     assert.equal(finalReceipt.response.status, 200, finalReceipt.body.error);
     assert.equal(finalReceipt.body.status, 'RECEIVED');
+    const supplierInvoice = await request(baseUrl, cookie, '/api/procurement/supplier-invoices', 'POST', {
+      purchaseOrderId: orderId, supplierInvoiceNumber: `INV-${suffix}`, invoiceQuantity: 5, invoiceAmount: 580,
+    });
+    assert.equal(supplierInvoice.response.status, 201, supplierInvoice.body.error);
+    supplierInvoiceId = supplierInvoice.body.id;
+    const invoiceMatch = await request(baseUrl, cookie, `/api/procurement/supplier-invoices/${supplierInvoiceId}/match`, 'POST', {});
+    assert.equal(invoiceMatch.response.status, 200, invoiceMatch.body.error);
+    assert.equal(invoiceMatch.body.status, 'MATCHED');
 
     const workspace = await request(baseUrl, cookie, '/api/procurement/workspace');
     const savedComparison = workspace.body.comparisons.find((item) => item.id === comparisonId);
@@ -126,12 +153,20 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     );
   } finally {
     if (databasePool && comparisonId) {
+      if (supplierInvoiceId) {
+        await databasePool.query('DELETE FROM procurement_audit_history WHERE entity_id=$1', [supplierInvoiceId]);
+        await databasePool.query('DELETE FROM procurement_supplier_invoices WHERE id=$1', [supplierInvoiceId]);
+      }
       await databasePool.query(
         'DELETE FROM procurement_audit_history WHERE entity_id = ANY($1::uuid[])',
         [[comparisonId, orderId].filter(Boolean)],
       );
       await databasePool.query('DELETE FROM procurement_purchase_orders WHERE comparison_id = $1', [comparisonId]);
       await databasePool.query('DELETE FROM procurement_comparisons WHERE id = $1', [comparisonId]);
+    }
+    if (databasePool && requisitionId) {
+      await databasePool.query('DELETE FROM procurement_audit_history WHERE entity_id=$1', [requisitionId]);
+      await databasePool.query('DELETE FROM procurement_requisitions WHERE id=$1', [requisitionId]);
     }
     if (databasePool && createdSupplierIds.length) {
       await databasePool.query(

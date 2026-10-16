@@ -23,6 +23,143 @@
   box-sizing: border-box;
 }
 
+.governance-workspace {
+  display: grid;
+  gap: 18px;
+}
+
+.governance-intro h2,
+.governance-content h3 {
+  margin: 0 0 8px;
+}
+
+.governance-intro p:last-child,
+.governance-notice p:last-child {
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.governance-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.governance-tabs button {
+  border: 1px solid transparent;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: 10px 12px;
+}
+
+.governance-tabs button.active {
+  border-color: var(--line);
+  border-bottom-color: var(--panel);
+  background: var(--panel);
+  color: var(--primary);
+  margin-bottom: -1px;
+}
+
+.governance-content {
+  display: grid;
+  gap: 18px;
+}
+
+.governance-content > h3 {
+  margin-top: 12px;
+}
+
+.governance-form,
+.governance-form-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.governance-form {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  align-items: end;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-alt);
+}
+
+.governance-form h3 {
+  grid-column: 1 / -1;
+}
+
+.governance-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.governance-form input,
+.governance-form select {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  padding: 9px 10px;
+}
+
+.governance-form button {
+  justify-self: start;
+}
+
+.governance-form-error {
+  grid-column: 1 / -1;
+  color: var(--danger);
+}
+
+.governance-form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+}
+
+.governance-form-wide {
+  grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+}
+
+.governance-notice {
+  border-left: 4px solid var(--warning);
+}
+
+.governance-message {
+  margin: 0;
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--primary-deep);
+  padding: 10px 12px;
+}
+
+.governance-content .table-wrap {
+  max-height: 480px;
+}
+
+@media (max-width: 680px) {
+  .governance-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+
+  .governance-tabs button {
+    flex: 0 0 auto;
+  }
+
+  .governance-form {
+    grid-template-columns: 1fr;
+  }
+}
+
 .hr-workspace > h3,
 .hr-workspace > h4 {
   margin: 24px 0 10px;
@@ -339,6 +476,143 @@
 
 .attendance-timezone-note {
   margin: 4px 0 12px;
+}
+
+.attendance-calendar {
+  margin: 14px 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.attendance-calendar-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.attendance-calendar-heading h4,
+.attendance-calendar-heading p {
+  margin: 0;
+}
+
+.attendance-calendar-heading p,
+.attendance-fasting-note {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.attendance-calendar-heading label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.attendance-calendar-heading input {
+  min-height: 38px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  font: inherit;
+}
+
+.attendance-calendar-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.attendance-calendar-legend span::before {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #698a84;
+  content: '';
+}
+
+.attendance-calendar-legend .legend-holiday::before { background: #bd782b; }
+.attendance-calendar-legend .legend-fasting::before { background: #517b9c; }
+
+.attendance-calendar-scroll {
+  overflow-x: auto;
+}
+
+.attendance-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(74px, 1fr));
+  min-width: 560px;
+  gap: 4px;
+}
+
+.attendance-calendar-weekday {
+  padding: 7px 5px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.attendance-calendar-day {
+  display: flex;
+  min-height: 100px;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.attendance-calendar-day.is-rest-day { background: #f0f5f3; }
+.attendance-calendar-day.is-holiday { border-color: #d8b27f; background: #fff8ec; }
+.attendance-calendar-day.is-fasting { box-shadow: inset 0 3px #86a9c1; }
+.attendance-calendar-day.is-today { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.attendance-calendar-date {
+  color: var(--text);
+  font-size: 0.88rem;
+  font-weight: 750;
+}
+
+.attendance-calendar-ethiopian,
+.attendance-calendar-count {
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+
+.attendance-calendar-labels {
+  display: grid;
+  gap: 2px;
+}
+
+.attendance-calendar-label {
+  overflow-wrap: anywhere;
+  color: #8a561e;
+  font-size: 0.64rem;
+  line-height: 1.2;
+}
+
+.attendance-calendar-day.is-fasting .attendance-calendar-label:last-child {
+  color: #416982;
+}
+
+.attendance-fasting-note {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-left: 3px solid #517b9c;
+  background: #f3f7fa;
 }
 
 .hr-calendar {
@@ -914,6 +1188,129 @@
   gap: 12px;
 }
 
+.inventory-trace-workspace {
+  display: grid;
+  gap: 14px;
+}
+
+.inventory-trace-workspace h4 {
+  margin: 8px 0 -5px;
+}
+
+.inventory-trace-forms {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 12px;
+}
+
+.inventory-trace-form,
+.inventory-trace-scan {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+
+.inventory-trace-form h4,
+.inventory-trace-form > button,
+.inventory-trace-form > .inventory-trace-error,
+.inventory-trace-wide {
+  grid-column: 1 / -1;
+}
+
+.inventory-trace-form label,
+.inventory-trace-scan label {
+  display: grid;
+  gap: 5px;
+  color: var(--text);
+  font-size: 0.84rem;
+  font-weight: 650;
+}
+
+.inventory-trace-form label span {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 400;
+}
+
+.inventory-trace-form input,
+.inventory-trace-form select,
+.inventory-trace-form textarea,
+.inventory-trace-scan input {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 9px;
+  color: var(--text);
+  background: var(--surface, #fff);
+  font: inherit;
+}
+
+.inventory-trace-form textarea {
+  resize: vertical;
+}
+
+.inventory-trace-scan {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.inventory-trace-scan label,
+.inventory-trace-lookup-result {
+  grid-column: 1 / -1;
+}
+
+.inventory-trace-lookup-result {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(31, 111, 87, 0.08);
+}
+
+.inventory-trace-error {
+  color: #a51d2d;
+  font-size: 0.82rem;
+}
+
+.inventory-trace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.inventory-trace-workspace [data-qr-label-container] {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+
+.inventory-trace-workspace [data-qr-label-container] img {
+  width: 120px;
+  height: 120px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.transfer-status.quarantined,
+.transfer-status.returned {
+  color: #854d0e;
+  background: #fef3c7;
+}
+
+.transfer-status.damaged,
+.transfer-status.expired {
+  color: #8a1c27;
+  background: #fde7e9;
+}
+
 .inventory-transfer-heading {
   display: flex;
   align-items: center;
@@ -1410,7 +1807,8 @@
   .sales-summary,
   .sales-report-grid,
   .inventory-transfer-form,
-  .inventory-count-line {
+  .inventory-count-line,
+  .inventory-trace-form {
     grid-template-columns: 1fr;
   }
 
@@ -1419,6 +1817,13 @@
   }
 
   .inventory-transfer-form .transfer-reason-field {
+    grid-column: auto;
+  }
+
+  .inventory-trace-form h4,
+  .inventory-trace-form > button,
+  .inventory-trace-form > .inventory-trace-error,
+  .inventory-trace-wide {
     grid-column: auto;
   }
 

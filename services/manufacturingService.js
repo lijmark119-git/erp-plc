@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { accountingService } from './accountingService.js';
 import { inventoryService } from './inventoryService.js';
+import { isValidISODate } from '../validation.js';
 
 export class ManufacturingError extends Error {
   constructor(status, message) {
@@ -40,7 +41,7 @@ function positive(value, name, allowZero = false) {
 
 function validDate(value, name, optional = false) {
   if (optional && !value) return null;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) || Number.isNaN(Date.parse(`${value}T00:00:00Z`))) {
+  if (!isValidISODate(value)) {
     throw new ManufacturingError(400, `${name} must use YYYY-MM-DD.`);
   }
   return value;
@@ -69,6 +70,15 @@ async function getWarehouse(client, organizationId, warehouseId) {
     [organizationId, warehouseId],
   );
   if (!result.rows[0]) throw new ManufacturingError(404, 'Active warehouse not found.');
+  return result.rows[0];
+}
+
+async function getWorkCenter(client, organizationId, workCenterId) {
+  const result = await client.query(
+    'SELECT * FROM manufacturing_work_centers WHERE organization_id=$1 AND id=$2 AND active=TRUE',
+    [organizationId, workCenterId],
+  );
+  if (!result.rows[0]) throw new ManufacturingError(404, 'Active work center not found.');
   return result.rows[0];
 }
 
@@ -277,22 +287,43 @@ async function loadDemand(client, organizationId, input) {
   }));
   const from = validDate(input.startDate || today(), 'startDate');
   const to = validDate(input.endDate || new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10), 'endDate');
-  const result = await client.query(
-    `SELECT product.id AS product_id, SUM(line.quantity) AS quantity
-     FROM sales_order_lines line
-     JOIN sales_orders order_header ON order_header.id = line.sales_order_id
-     JOIN inventory_products product ON product.organization_id = order_header.organization_id AND product.sku = line.product_sku
-     WHERE order_header.organization_id = $1 AND order_header.status = 'Approved'
-       AND order_header.delivery_date BETWEEN $2 AND $3
-     GROUP BY product.id`,
-    [organizationId, from, to],
-  );
-  return result.rows.map((row) => ({ productId: row.product_id, quantity: Number(row.quantity) }));
+  if (from > to) throw new ManufacturingError(400, 'startDate must not be after endDate.');
+  const source = input.demandSource || 'SALES_ORDERS';
+  if (!['SALES_ORDERS', 'FORECAST', 'COMBINED'].includes(source)) {
+    throw new ManufacturingError(400, 'demandSource must be SALES_ORDERS, FORECAST, or COMBINED.');
+  }
+  const demands = new Map();
+  if (source !== 'FORECAST') {
+    const sales = await client.query(
+      `SELECT product.id AS product_id, SUM(line.quantity) AS quantity
+       FROM sales_order_lines line
+       JOIN sales_orders order_header ON order_header.id = line.sales_order_id
+       JOIN inventory_products product ON product.organization_id = order_header.organization_id AND product.sku = line.product_sku
+       WHERE order_header.organization_id = $1 AND order_header.status = 'Approved'
+         AND order_header.delivery_date BETWEEN $2 AND $3
+       GROUP BY product.id`,
+      [organizationId, from, to],
+    );
+    for (const row of sales.rows) demands.set(row.product_id, Number(row.quantity));
+  }
+  if (source !== 'SALES_ORDERS') {
+    const forecasts = await client.query(
+      `SELECT product_id, SUM(quantity) AS quantity
+       FROM manufacturing_demand_forecasts
+       WHERE organization_id = $1 AND forecast_date BETWEEN $2 AND $3
+       GROUP BY product_id`,
+      [organizationId, from, to],
+    );
+    for (const row of forecasts.rows) {
+      demands.set(row.product_id, (demands.get(row.product_id) || 0) + Number(row.quantity));
+    }
+  }
+  return [...demands].map(([productId, quantity]) => ({ productId, quantity }));
 }
 
 export const manufacturingService = {
   async getWorkspace(client, organizationId) {
-    const [workCenters, boms, routings, orders, supplies, latestRun, products, warehouses, receipts, lots] = await Promise.all([
+    const [workCenters, boms, routings, orders, supplies, latestRun, products, warehouses, receipts, lots, forecasts, maintenance] = await Promise.all([
       client.query('SELECT * FROM manufacturing_work_centers WHERE organization_id = $1 ORDER BY name', [organizationId]),
       client.query(
         `SELECT bom.*, product.sku AS finished_sku, product.name AS finished_name,
@@ -322,6 +353,16 @@ export const manufacturingService = {
          FROM manufacturing_lots lot JOIN inventory_products product ON product.id = lot.product_id
          WHERE lot.organization_id = $1 ORDER BY lot.created_at DESC`, [organizationId],
       ),
+      client.query(
+        `SELECT forecast.*, product.sku, product.name AS product_name
+         FROM manufacturing_demand_forecasts forecast JOIN inventory_products product ON product.id=forecast.product_id
+         WHERE forecast.organization_id=$1 ORDER BY forecast.forecast_date, product.name`, [organizationId],
+      ),
+      client.query(
+        `SELECT event.*, center.code AS work_center_code, center.name AS work_center_name
+         FROM manufacturing_maintenance_events event JOIN manufacturing_work_centers center ON center.id=event.work_center_id
+         WHERE event.organization_id=$1 ORDER BY event.scheduled_date DESC, event.created_at DESC`, [organizationId],
+      ),
     ]);
     const summary = await this.getReport(client, organizationId, 'wip');
     const latestRequirements = latestRun.rows[0]
@@ -337,6 +378,8 @@ export const manufacturingService = {
       warehouses: warehouses.rows,
       inventoryReceipts: receipts.rows,
       lots: lots.rows,
+      forecasts: forecasts.rows,
+      maintenance: maintenance.rows,
       latestMrp: latestRun.rows[0] ? { ...latestRun.rows[0], requirements: latestRequirements } : null,
       summary,
     };
@@ -344,6 +387,66 @@ export const manufacturingService = {
 
   async listWorkCenters(client, organizationId) {
     return (await client.query('SELECT * FROM manufacturing_work_centers WHERE organization_id = $1 ORDER BY name', [organizationId])).rows;
+  },
+
+  async createDemandForecast(client, organizationId, actorId, input) {
+    const productId = requiredText(input.productId, 'productId');
+    const forecastDate = validDate(input.forecastDate, 'forecastDate');
+    const quantity = positive(input.quantity, 'quantity');
+    await getProduct(client, organizationId, productId);
+    return transaction(client, async () => {
+      const result = await client.query(
+        `INSERT INTO manufacturing_demand_forecasts
+           (organization_id, product_id, forecast_date, quantity, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (organization_id, product_id, forecast_date)
+         DO UPDATE SET quantity=EXCLUDED.quantity, notes=EXCLUDED.notes
+         RETURNING *`,
+        [organizationId, productId, forecastDate, quantity, input.notes ? String(input.notes).trim() : null, actorId],
+      );
+      await audit(client, organizationId, actorId, 'demand_forecast_saved', 'demand_forecast', result.rows[0].id, { productId, forecastDate, quantity });
+      return result.rows[0];
+    });
+  },
+
+  async createMaintenanceEvent(client, organizationId, actorId, input) {
+    const workCenterId = requiredText(input.workCenterId, 'workCenterId');
+    const maintenanceType = String(input.maintenanceType || 'PREVENTIVE').toUpperCase();
+    if (!['PREVENTIVE', 'CORRECTIVE'].includes(maintenanceType)) {
+      throw new ManufacturingError(400, 'maintenanceType must be PREVENTIVE or CORRECTIVE.');
+    }
+    const description = requiredText(input.description, 'description').slice(0, 240);
+    const scheduledDate = validDate(input.scheduledDate, 'scheduledDate');
+    const nextDueDate = validDate(input.nextDueDate, 'nextDueDate', true);
+    await getWorkCenter(client, organizationId, workCenterId);
+    return transaction(client, async () => {
+      const result = await client.query(
+        `INSERT INTO manufacturing_maintenance_events
+           (organization_id, work_center_id, maintenance_type, description, scheduled_date, next_due_date, notes, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [organizationId, workCenterId, maintenanceType, description, scheduledDate, nextDueDate,
+          input.notes ? String(input.notes).trim() : null, actorId],
+      );
+      await audit(client, organizationId, actorId, 'maintenance_scheduled', 'maintenance_event', result.rows[0].id, { workCenterId, maintenanceType, scheduledDate });
+      return result.rows[0];
+    });
+  },
+
+  async completeMaintenanceEvent(client, organizationId, actorId, eventId, downtimeMinutes) {
+    const downtime = positive(downtimeMinutes ?? 0, 'downtimeMinutes', true);
+    return transaction(client, async () => {
+      const result = await client.query(
+        `UPDATE manufacturing_maintenance_events
+         SET status='COMPLETED', downtime_minutes=$1, completed_by=$2, completed_at=CURRENT_TIMESTAMP,
+             updated_at=CURRENT_TIMESTAMP
+         WHERE id=$3 AND organization_id=$4 AND status='PLANNED'
+         RETURNING *`,
+        [downtime, actorId, eventId, organizationId],
+      );
+      if (!result.rows[0]) throw new ManufacturingError(409, 'Only scheduled maintenance can be completed.');
+      await audit(client, organizationId, actorId, 'maintenance_completed', 'maintenance_event', eventId, { downtimeMinutes: downtime });
+      return result.rows[0];
+    });
   },
 
   async createWorkCenter(client, organizationId, actorId, input) {
@@ -885,9 +988,10 @@ export const manufacturingService = {
         const netBuild = Math.max(0, demand.quantity + Number(product.reorder_level) - onHand - openProduction);
         if (netBuild > 0) await explodeProduct(client, organizationId, product.id, netBuild, planningDate, [], exploded);
       }
+      const demandSource = input.demands?.length ? 'MANUAL' : (input.demandSource || 'SALES_ORDERS');
       const run = (await client.query(
-        'INSERT INTO manufacturing_mrp_runs (organization_id,planning_date,created_by) VALUES ($1,$2,$3) RETURNING *',
-        [organizationId, planningDate, actorId],
+        'INSERT INTO manufacturing_mrp_runs (organization_id,planning_date,demand_source,created_by) VALUES ($1,$2,$3,$4) RETURNING *',
+        [organizationId, planningDate, demandSource, actorId],
       )).rows[0];
       const requirements = [];
       for (const { product, grossRequired } of exploded.values()) {

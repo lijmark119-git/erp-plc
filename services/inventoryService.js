@@ -47,6 +47,23 @@ import {
   updateInventoryProduct,
   getInventoryProduct as getProduct,
 } from '../repositories/inventoryManagementRepository.js';
+import {
+  createInventoryStockReservation,
+  dispatchInventoryTransferSerials,
+  fulfillInventoryStockReservation,
+  getInventoryAvailableQuantity,
+  getInventorySerialNumbers,
+  getInventoryStockReservations,
+  getInventoryTraceLots,
+  issueInventorySerialNumbers,
+  lockInventoryPosition,
+  lookupInventoryTraceCode,
+  registerInventorySerialNumbers,
+  registerInventoryTraceLot,
+  releaseInventoryStockReservation,
+  receiveInventoryTransferSerials,
+  updateInventoryLotQuality,
+} from '../repositories/inventoryTraceabilityRepository.js';
 
 const ACCOUNT_CODES = {
   receive: ['inventory_account_code', 'grni_account_code'],
@@ -188,13 +205,32 @@ export const inventoryService = {
         referenceId: movement.referenceId || null,
         transactionDate: movement.transactionDate || new Date(),
       });
+      let traceLot = null;
+      let serials = [];
+      if (movement.traceLotNumber) {
+        traceLot = await registerInventoryTraceLot(client, organizationId, actorId, {
+          inventoryTransactionId: transaction.id,
+          lotNumber: movement.traceLotNumber,
+          quantity: movement.traceLotQuantity ?? quantity,
+          expiryDate: movement.expiryDate,
+          warrantyEndDate: movement.warrantyEndDate,
+          barcode: movement.lotBarcode,
+          qualityStatus: movement.qualityStatus,
+        });
+        serials = await registerInventorySerialNumbers(client, organizationId, {
+          serialNumbers: movement.serialNumbers,
+        }, traceLot);
+      } else if (movement.serialNumbers != null || movement.expiryDate || movement.warrantyEndDate
+        || movement.lotBarcode || movement.qualityStatus) {
+        throw new Error('Lot and serial tracking fields require traceLotNumber.');
+      }
       const journal = await createMovementJournal(client, organizationId, actorId, transaction, product, 'IN', movement);
       if (movement.postToLedger) {
         const posted = await postAccountingJournal(client, organizationId, actorId, journal.id);
         if (!posted) throw new Error('Inventory receipt journal could not be posted.');
-        return { transaction, journal: { ...journal, ...posted } };
+        return { transaction, journal: { ...journal, ...posted }, lot: traceLot, serials };
       }
-      return { transaction, journal };
+      return { transaction, journal, lot: traceLot, serials };
     }, input.manageTransaction !== false);
   },
   async issue(client, organizationId, actorId, input) {
@@ -203,9 +239,48 @@ export const inventoryService = {
       const product = await getInventoryProduct(client, organizationId, movement.productId);
       if (!product || !product.active) throw new Error('Inventory product not found or inactive.');
       const quantity = toNumber(movement.quantity);
-      const balance = await getInventoryBalance(client, organizationId, product.id, movement.warehouseId);
-      if (balance.quantity < quantity) throw new Error(`Insufficient stock. Available: ${balance.quantity}`);
       const transactionType = movement.transactionType || (movement.referenceType === 'SALES_DELIVERY' ? 'SALES_DELIVERY' : 'PRODUCTION_CONSUMPTION');
+      await lockInventoryPosition(client, organizationId, product.id, movement.warehouseId);
+      let reservation = null;
+      if (movement.reservationId) {
+        reservation = (await client.query(
+          `SELECT * FROM inventory_stock_reservations
+           WHERE id = $1 AND organization_id = $2 FOR UPDATE`,
+          [movement.reservationId, organizationId],
+        )).rows[0];
+      } else if (transactionType === 'SALES_DELIVERY' && movement.referenceId) {
+        reservation = (await client.query(
+          `SELECT * FROM inventory_stock_reservations
+           WHERE organization_id = $1 AND product_id = $2 AND warehouse_id = $3
+             AND reference_id = $4 AND reference_type IN ('SALES_DELIVERY', 'SALES_ORDER')
+             AND status = 'ACTIVE'
+           ORDER BY created_at LIMIT 1 FOR UPDATE`,
+          [organizationId, product.id, movement.warehouseId, movement.referenceId],
+        )).rows[0];
+      }
+      if (movement.reservationId && (!reservation || reservation.status !== 'ACTIVE'
+        || reservation.product_id !== product.id || reservation.warehouse_id !== movement.warehouseId)) {
+        throw new Error('Active reservation does not match this product and warehouse.');
+      }
+      if (reservation) {
+        if (reservation.location_id && movement.locationId && reservation.location_id !== movement.locationId) {
+          throw new Error('Issue location does not match the reserved location.');
+        }
+        movement.locationId = movement.locationId || reservation.location_id;
+      }
+      const available = await getInventoryAvailableQuantity(
+        client, organizationId, product.id, movement.warehouseId, movement.locationId || null,
+      );
+      if (reservation) {
+        const ownReserved = Number(reservation.quantity) - Number(reservation.fulfilled_quantity);
+        available.available = Math.max(
+          0,
+          available.onHand - available.unavailable - Math.max(0, available.reserved - ownReserved),
+        );
+      }
+      if (available.available + 0.000001 < quantity) {
+        throw new Error(`Insufficient stock. Available unreserved quantity: ${Math.max(0, available.available)}`);
+      }
       const transaction = await createStockTransaction(client, organizationId, actorId, {
         ...movement, quantity, unitCost: movement.unitCost ?? product.standard_cost,
         transactionType,
@@ -213,14 +288,20 @@ export const inventoryService = {
         referenceId: movement.referenceId || null,
         transactionDate: movement.transactionDate || new Date(),
       });
+      const serials = await issueInventorySerialNumbers(client, organizationId, actorId, movement, transaction);
+      if (reservation) {
+        await fulfillInventoryStockReservation(
+          client, organizationId, actorId, reservation.id, product.id, movement.warehouseId, quantity,
+        );
+      }
       await traceFinishedLotShipment(client, organizationId, transaction, product, movement);
       const journal = await createMovementJournal(client, organizationId, actorId, transaction, product, 'OUT', { ...movement, transactionType });
       if (movement.postToLedger) {
         const posted = await postAccountingJournal(client, organizationId, actorId, journal.id);
         if (!posted) throw new Error('Inventory issue journal could not be posted.');
-        return { transaction, journal: { ...journal, ...posted } };
+        return { transaction, journal: { ...journal, ...posted }, serials };
       }
-      return { transaction, journal };
+      return { transaction, journal, serials };
     }, input.manageTransaction !== false);
   },
   async createTransfer(client, organizationId, actorId, input) {
@@ -242,8 +323,16 @@ export const inventoryService = {
     return executeAtomicMovement(client, organizationId, actorId, async () => {
       const transfer = await getInventoryTransferRequest(client, organizationId, transferId);
       if (!transfer || transfer.status !== 'APPROVED') return null;
+      await lockInventoryPosition(client, organizationId, transfer.product_id, transfer.source_warehouse_id);
+      const available = await getInventoryAvailableQuantity(
+        client, organizationId, transfer.product_id, transfer.source_warehouse_id, transfer.source_location_id || null,
+      );
+      if (available.available + 0.000001 < Number(transfer.approved_quantity)) {
+        throw new Error(`Insufficient unreserved stock for transfer. Available: ${available.available}`);
+      }
       const product = await getInventoryProduct(client, organizationId, transfer.product_id);
       const result = await dispatchTransferRequest(client, organizationId, actorId, transferId, reason);
+      await dispatchInventoryTransferSerials(client, organizationId, actorId, { ...transfer, ...result });
       const transaction = (await getInventoryStockTransactions(client, organizationId, {
         transactionType: 'STOCK_TRANSFER',
       })).find((row) => row.reference_id === transfer.id && row.direction === 'OUT');
@@ -258,6 +347,7 @@ export const inventoryService = {
       if (!transfer || transfer.status !== 'DISPATCHED') return null;
       const product = await getInventoryProduct(client, organizationId, transfer.product_id);
       const result = await receiveTransferRequest(client, organizationId, actorId, transferId, reason);
+      await receiveInventoryTransferSerials(client, organizationId, actorId, { ...transfer, ...result });
       const transaction = (await getInventoryStockTransactions(client, organizationId, {
         transactionType: 'STOCK_TRANSFER',
       })).find((row) => row.direction === 'IN' && (
@@ -359,5 +449,32 @@ export const inventoryService = {
   },
   async convertUom(client, organizationId, fromUomId, toUomId, quantity) {
     return convertUomQuantity(client, organizationId, fromUomId, toUomId, quantity);
+  },
+  async reserveStock(client, organizationId, actorId, input) {
+    return executeAtomicMovement(client, organizationId, actorId, () => (
+      createInventoryStockReservation(client, organizationId, actorId, input)
+    ));
+  },
+  async getStockReservations(client, organizationId, status = null) {
+    return getInventoryStockReservations(client, organizationId, status);
+  },
+  async releaseStockReservation(client, organizationId, actorId, reservationId) {
+    return executeAtomicMovement(client, organizationId, actorId, () => (
+      releaseInventoryStockReservation(client, organizationId, actorId, reservationId)
+    ));
+  },
+  async getTraceLots(client, organizationId) {
+    return getInventoryTraceLots(client, organizationId);
+  },
+  async getSerialNumbers(client, organizationId) {
+    return getInventorySerialNumbers(client, organizationId);
+  },
+  async lookupTraceCode(client, organizationId, code) {
+    return lookupInventoryTraceCode(client, organizationId, code);
+  },
+  async updateLotQuality(client, organizationId, actorId, lotId, input) {
+    return executeAtomicMovement(client, organizationId, actorId, async () => (
+      updateInventoryLotQuality(client, organizationId, actorId, lotId, input.qualityStatus, input.reason)
+    ));
   },
 };

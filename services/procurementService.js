@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { isValidBusinessCode, isValidEmail, isValidPersonName, isValidPhone } from '../validation.js';
 
 export class ProcurementError extends Error {
   constructor(status, message) {
@@ -36,9 +37,10 @@ async function addHistory(client, organizationId, actorId, entityType, entityId,
 }
 
 export async function getProcurementWorkspace(client, organizationId) {
-  const [suppliers, comparisons, quotes, orders, history] = await Promise.all([
+  const [suppliers, comparisons, quotes, orders, history, requisitions, supplierInvoices, scorecards] = await Promise.all([
     client.query(
-      `SELECT id, supplier_code, name, contact_name, email, phone, payment_terms, notes, active, created_at
+      `SELECT id, supplier_code, name, contact_name, email, phone, payment_terms, notes, active, created_at,
+              qualification_status, risk_level
        FROM procurement_suppliers
        WHERE organization_id = $1 AND active = TRUE
        ORDER BY name`,
@@ -85,6 +87,36 @@ export async function getProcurementWorkspace(client, organizationId) {
        LIMIT 300`,
       [organizationId],
     ),
+    client.query('SELECT * FROM procurement_requisitions WHERE organization_id=$1 ORDER BY created_at DESC', [organizationId]),
+    client.query(
+      `SELECT invoice.*, po.po_number, supplier.name AS supplier_name,
+              comparison.quantity AS ordered_quantity, po.received_quantity,
+              quote.unit_price, quote.tax_amount, quote.shipping_cost, quote.other_cost,
+              comparison.quantity * quote.unit_price + quote.tax_amount + quote.shipping_cost + quote.other_cost AS po_total
+       FROM procurement_supplier_invoices invoice
+       JOIN procurement_purchase_orders po ON po.id=invoice.purchase_order_id
+       JOIN procurement_suppliers supplier ON supplier.id=po.supplier_id
+       JOIN procurement_comparisons comparison ON comparison.id=po.comparison_id
+       JOIN procurement_supplier_quotes quote ON quote.id=po.quote_id
+       WHERE invoice.organization_id=$1 ORDER BY invoice.created_at DESC`, [organizationId],
+    ),
+    client.query(
+      `SELECT supplier.id, supplier.name, supplier.supplier_code, supplier.qualification_status, supplier.risk_level,
+              COUNT(DISTINCT po.id)::int AS order_count,
+              COALESCE(SUM(CASE WHEN po.status='RECEIVED' THEN 1 ELSE 0 END),0)::int AS completed_orders,
+              COALESCE(AVG(CASE WHEN po.status='RECEIVED' AND receipt.last_received_at::date <= po.expected_delivery_date THEN 100.0 ELSE 0.0 END),0) AS on_time_score,
+              COALESCE(SUM(comparison.quantity * quote.unit_price + quote.tax_amount + quote.shipping_cost + quote.other_cost),0) AS spend
+       FROM procurement_suppliers supplier
+       LEFT JOIN procurement_purchase_orders po ON po.supplier_id=supplier.id AND po.organization_id=supplier.organization_id
+       LEFT JOIN LATERAL (
+         SELECT MAX(received_at) AS last_received_at FROM procurement_purchase_order_receipts receipt
+         WHERE receipt.purchase_order_id=po.id AND receipt.organization_id=po.organization_id
+       ) receipt ON TRUE
+       LEFT JOIN procurement_comparisons comparison ON comparison.id=po.comparison_id
+       LEFT JOIN procurement_supplier_quotes quote ON quote.id=po.quote_id
+       WHERE supplier.organization_id=$1
+       GROUP BY supplier.id ORDER BY spend DESC, supplier.name`, [organizationId],
+    ),
   ]);
   const quotesByComparison = new Map();
   for (const quote of quotes.rows) {
@@ -110,6 +142,9 @@ export async function getProcurementWorkspace(client, organizationId) {
       ...order,
       history: historyByEntity.get(`PURCHASE_ORDER:${order.id}`) || [],
     })),
+    requisitions: requisitions.rows,
+    supplierInvoices: supplierInvoices.rows,
+    scorecards: scorecards.rows,
   };
 }
 
@@ -117,13 +152,20 @@ export async function createSupplier(client, organizationId, actorId, input) {
   const name = String(input.name || '').trim();
   const supplierCode = String(input.supplierCode || '').trim();
   if (!name || !supplierCode) throw new ProcurementError(400, 'Supplier name and supplier code are required.');
+  if (name.length > 180 || !isValidBusinessCode(supplierCode, 60)) throw new ProcurementError(400, 'Supplier name or code has an invalid format.');
+  if ((input.contactName && !isValidPersonName(input.contactName)) || !isValidEmail(input.email ?? '')) {
+    throw new ProcurementError(400, 'Contact person or email has an invalid format.');
+  }
+  if (!isValidPhone(input.phone ?? '')) throw new ProcurementError(400, 'Phone must contain 7 to 15 digits and only standard phone characters.');
   const result = await client.query(
     `INSERT INTO procurement_suppliers
-       (organization_id, supplier_code, name, contact_name, email, phone, payment_terms, notes, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     RETURNING id, supplier_code, name, contact_name, email, phone, payment_terms, notes, active, created_at`,
+       (organization_id, supplier_code, name, contact_name, email, phone, payment_terms, notes, created_by, qualification_status, risk_level)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     RETURNING id, supplier_code, name, contact_name, email, phone, payment_terms, notes, active, created_at, qualification_status, risk_level`,
     [organizationId, supplierCode, name, input.contactName || null, input.email || null,
-      input.phone || null, input.paymentTerms || null, input.notes || null, actorId],
+      input.phone || null, input.paymentTerms || null, input.notes || null, actorId,
+      ['PENDING', 'QUALIFIED', 'SUSPENDED'].includes(input.qualificationStatus) ? input.qualificationStatus : 'PENDING',
+      ['LOW', 'MEDIUM', 'HIGH'].includes(input.riskLevel) ? input.riskLevel : 'MEDIUM'],
   );
   await addHistory(client, organizationId, actorId, 'SUPPLIER', result.rows[0].id, 'SUPPLIER_CREATED');
   return result.rows[0];
@@ -295,6 +337,7 @@ export async function receivePurchaseOrder(client, organizationId, actorId, orde
   if (!['APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED'].includes(order.status)) {
     throw new ProcurementError(409, 'Approve the purchase order before receiving stock.');
   }
+
   const totalReceived = Number(order.received_quantity) + quantity;
   if (totalReceived > Number(order.ordered_quantity)) {
     throw new ProcurementError(400, 'Received quantity cannot exceed the ordered quantity.');
@@ -317,4 +360,104 @@ export async function receivePurchaseOrder(client, organizationId, actorId, orde
     quantity, totalReceived, orderedQuantity: Number(order.ordered_quantity),
   });
   return updated.rows[0];
+}
+
+export async function createPurchaseRequisition(client, organizationId, actorId, input) {
+  const title = String(input.title || '').trim();
+  const description = String(input.description || '').trim();
+  if (!title || !description) throw new ProcurementError(400, 'Requisition title and description are required.');
+  const quantity = asPositive(input.quantity, 'Quantity');
+  const estimatedUnitCost = asPositive(input.estimatedUnitCost, 'Estimated unit cost', true);
+  const budgetLimit = asPositive(input.budgetLimit, 'Budget limit', true);
+  const estimatedTotal = roundedMoney(quantity * estimatedUnitCost);
+  if (estimatedTotal > budgetLimit) throw new ProcurementError(409, `Budget validation failed: estimated total ${estimatedTotal} exceeds budget ${budgetLimit}.`);
+  const requisitionNumber = `REQ-${new Date().getUTCFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const result = await client.query(
+    `INSERT INTO procurement_requisitions
+       (organization_id,requisition_number,title,description,quantity,estimated_unit_cost,budget_limit,requested_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [organizationId, requisitionNumber, title, description, quantity, estimatedUnitCost, budgetLimit, actorId],
+  );
+  await addHistory(client, organizationId, actorId, 'REQUISITION', result.rows[0].id, 'REQUISITION_SUBMITTED', null, { estimatedTotal, budgetLimit });
+  return result.rows[0];
+}
+
+export async function decidePurchaseRequisition(client, organizationId, actorId, requisitionId, decision, reason) {
+  if (!['APPROVED', 'REJECTED'].includes(decision)) throw new ProcurementError(400, 'Decision must be APPROVED or REJECTED.');
+  const note = String(reason || '').trim();
+  if (!note) throw new ProcurementError(400, 'A decision reason is required.');
+  const result = await client.query(
+    `UPDATE procurement_requisitions
+     SET status=$1, decided_by=$2, decision_reason=$3, updated_at=CURRENT_TIMESTAMP
+     WHERE id=$4 AND organization_id=$5 AND status='SUBMITTED' RETURNING *`,
+    [decision, actorId, note, requisitionId, organizationId],
+  );
+  if (!result.rows[0]) throw new ProcurementError(409, 'Only submitted requisitions can be decided.');
+  await addHistory(client, organizationId, actorId, 'REQUISITION', requisitionId, decision, note);
+  return result.rows[0];
+}
+
+export async function createSupplierInvoice(client, organizationId, actorId, input) {
+  const purchaseOrderId = String(input.purchaseOrderId || '');
+  const invoiceNumber = String(input.supplierInvoiceNumber || '').trim();
+  if (!invoiceNumber) throw new ProcurementError(400, 'Supplier invoice number is required.');
+  const invoiceQuantity = asPositive(input.invoiceQuantity, 'Invoice quantity');
+  const invoiceAmount = asPositive(input.invoiceAmount, 'Invoice amount', true);
+  const invoiceDate = input.invoiceDate || new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(invoiceDate) || Number.isNaN(Date.parse(`${invoiceDate}T00:00:00Z`))) {
+    throw new ProcurementError(400, 'Invoice date must use YYYY-MM-DD.');
+  }
+  const order = (await client.query(
+    `SELECT po.id, po.received_quantity, comparison.quantity AS ordered_quantity,
+            comparison.quantity * quote.unit_price + quote.tax_amount + quote.shipping_cost + quote.other_cost AS po_total
+     FROM procurement_purchase_orders po
+     JOIN procurement_comparisons comparison ON comparison.id=po.comparison_id
+     JOIN procurement_supplier_quotes quote ON quote.id=po.quote_id
+     WHERE po.id=$1 AND po.organization_id=$2 AND po.status IN ('APPROVED','ORDERED','PARTIALLY_RECEIVED','RECEIVED')`,
+    [purchaseOrderId, organizationId],
+  )).rows[0];
+  if (!order) throw new ProcurementError(404, 'Approved purchase order not found.');
+  const notes = invoiceQuantity > Number(order.received_quantity)
+    ? `Invoice quantity ${invoiceQuantity} exceeds received quantity ${order.received_quantity}.`
+    : invoiceAmount > Number(order.po_total) + 0.01
+      ? `Invoice amount ${invoiceAmount} exceeds purchase order total ${Number(order.po_total)}.`
+      : null;
+  const result = await client.query(
+    `INSERT INTO procurement_supplier_invoices
+       (organization_id,purchase_order_id,supplier_invoice_number,invoice_quantity,invoice_amount,status,match_notes,invoice_date,created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [organizationId, purchaseOrderId, invoiceNumber, invoiceQuantity, invoiceAmount, notes ? 'EXCEPTION' : 'PENDING_MATCH',
+      notes, invoiceDate, actorId],
+  );
+  await addHistory(client, organizationId, actorId, 'SUPPLIER_INVOICE', result.rows[0].id, result.rows[0].status, notes, { purchaseOrderId });
+  return result.rows[0];
+}
+
+export async function matchSupplierInvoice(client, organizationId, actorId, invoiceId) {
+  const result = await client.query(
+    `UPDATE procurement_supplier_invoices invoice
+     SET status=CASE
+           WHEN invoice.status='EXCEPTION' THEN 'EXCEPTION'
+           WHEN invoice.invoice_quantity <= po.received_quantity
+             AND invoice.invoice_quantity <= comparison.quantity
+             AND invoice.invoice_amount <= comparison.quantity * quote.unit_price + quote.tax_amount + quote.shipping_cost + quote.other_cost + 0.01
+           THEN 'MATCHED' ELSE 'EXCEPTION' END,
+         match_notes=CASE
+           WHEN invoice.status='EXCEPTION' THEN invoice.match_notes
+           WHEN invoice.invoice_quantity > po.received_quantity THEN 'Three-way match failed: invoice quantity exceeds goods received.'
+           WHEN invoice.invoice_quantity > comparison.quantity THEN 'Three-way match failed: invoice quantity exceeds purchase order quantity.'
+           WHEN invoice.invoice_amount > comparison.quantity * quote.unit_price + quote.tax_amount + quote.shipping_cost + quote.other_cost + 0.01 THEN 'Three-way match failed: invoice amount exceeds purchase order value.'
+           ELSE NULL END,
+         matched_by=$2, matched_at=CURRENT_TIMESTAMP
+     FROM procurement_purchase_orders po
+     JOIN procurement_comparisons comparison ON comparison.id=po.comparison_id
+     JOIN procurement_supplier_quotes quote ON quote.id=po.quote_id
+     WHERE invoice.id=$1 AND invoice.organization_id=$3 AND invoice.purchase_order_id=po.id
+       AND invoice.status IN ('PENDING_MATCH','EXCEPTION')
+     RETURNING invoice.*`,
+    [invoiceId, actorId, organizationId],
+  );
+  if (!result.rows[0]) throw new ProcurementError(404, 'Supplier invoice not found or already paid.');
+  await addHistory(client, organizationId, actorId, 'SUPPLIER_INVOICE', invoiceId, result.rows[0].status, result.rows[0].match_notes);
+  return result.rows[0];
 }

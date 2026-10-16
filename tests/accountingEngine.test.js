@@ -146,16 +146,9 @@ test('reversal creates a balanced opposite journal and marks source reversed', a
 
 test('closed period rejects posting', async () => {
   const [asset, revenue] = await createTestAccounts();
-  const period = (await client.query(
-    'SELECT id, status, closed_at, updated_at FROM accounting_periods WHERE organization_id = $1 ORDER BY period_start DESC LIMIT 1',
-    [organizationId],
-  )).rows[0];
+  let period;
   let journal;
   try {
-    await client.query(
-      'UPDATE accounting_periods SET status = \'CLOSED\', closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
-      [period.id],
-    );
     journal = await accountingService.createJournal(client, organizationId, actorId, {
       transactionDate: new Date().toISOString().slice(0, 10),
       reference: `TEST-${randomUUID()}`,
@@ -168,6 +161,14 @@ test('closed period rejects posting', async () => {
         { accountId: revenue.id, debit: 0, credit: 25, description: 'Test revenue credit' },
       ],
     });
+    period = (await client.query(
+      'SELECT id, status, closed_at, updated_at FROM accounting_periods WHERE id = $1',
+      [journal.accounting_period_id],
+    )).rows[0];
+    await client.query(
+      'UPDATE accounting_periods SET status = \'CLOSED\', closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+      [period.id],
+    );
     await assert.rejects(() => accountingService.postJournal(client, organizationId, actorId, journal.id), /accounting period is closed/i);
   } finally {
     if (journal) {
@@ -175,10 +176,12 @@ test('closed period rejects posting', async () => {
       await client.query('DELETE FROM accounting_journals WHERE id = $1', [journal.id]);
     }
     await client.query('DELETE FROM accounting_accounts WHERE id IN ($1, $2)', [asset.id, revenue.id]);
-    await client.query(
-      'UPDATE accounting_periods SET status = $2, closed_at = $3, updated_at = $4 WHERE id = $1',
-      [period.id, period.status, period.closed_at, period.updated_at],
-    );
+    if (period) {
+      await client.query(
+        'UPDATE accounting_periods SET status = $2, closed_at = $3, updated_at = $4 WHERE id = $1',
+        [period.id, period.status, period.closed_at, period.updated_at],
+      );
+    }
   }
 });
 
@@ -317,5 +320,67 @@ test('automatic accounting templates post sales, purchasing, expense, inventory,
       await client.query('DELETE FROM accounting_journals WHERE id = ANY($1::uuid[])', [ids]);
     }
     await client.query('DELETE FROM accounting_accounts WHERE id = $1', [vatAccount.id]);
+  }
+});
+
+test('monthly budget variance uses posted journal actuals and governance dimensions', async () => {
+  const [asset, revenue] = await createTestAccounts();
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 10).toUpperCase();
+  const costCenterCode = `C${suffix}`;
+  const profitCenterCode = `P${suffix}`;
+  const fiscalYear = 2098;
+  const budgetCode = `B${suffix}`;
+  const journalDate = `${fiscalYear}-02-01`;
+  let journal;
+  let costCenter;
+  let profitCenter;
+  try {
+    costCenter = (await client.query(
+      `INSERT INTO enterprise_cost_centers (organization_id, code, name)
+       VALUES ($1, $2, $3) RETURNING id`,
+      [organizationId, costCenterCode, 'Budget variance test'],
+    )).rows[0];
+    profitCenter = (await client.query(
+      `INSERT INTO enterprise_profit_centers (organization_id, code, name)
+       VALUES ($1, $2, $3) RETURNING id`,
+      [organizationId, profitCenterCode, 'Budget variance test'],
+    )).rows[0];
+    await accountingService.saveBudgetLine(client, organizationId, actorId, {
+      budgetCode,
+      budgetName: 'Budget variance integration test',
+      fiscalYear,
+      periodStart: `${fiscalYear}-02-01`,
+      accountId: asset.id,
+      amount: 100,
+      costCenterCode,
+      profitCenterCode,
+    });
+    journal = await accountingService.createJournal(client, organizationId, actorId, {
+      transactionDate: journalDate,
+      description: 'Budget actual integration test',
+      sourceModule: 'test',
+      sourceTransactionId: randomUUID(),
+      status: 'APPROVED',
+      lines: [
+        { accountId: asset.id, debit: 125, credit: 0, description: 'Budgeted actual', costCenter: costCenterCode, profitCenter: profitCenterCode },
+        { accountId: revenue.id, debit: 0, credit: 125, description: 'Offsetting credit' },
+      ],
+    });
+    await accountingService.postJournal(client, organizationId, actorId, journal.id);
+    const report = await accountingService.getBudgetWorkspace(client, organizationId);
+    const line = report.find((item) => item.budget_code === budgetCode && new Date(item.period_start).toISOString().slice(0, 10) === journalDate);
+    assert.ok(line);
+    assert.equal(Number(line.budget_amount), 100);
+    assert.equal(Number(line.actual_amount), 125);
+    assert.equal(Number(line.variance), -25);
+  } finally {
+    if (journal) {
+      await client.query('DELETE FROM accounting_journal_lines WHERE journal_id = $1', [journal.id]);
+      await client.query('DELETE FROM accounting_journals WHERE id = $1', [journal.id]);
+    }
+    await client.query('DELETE FROM accounting_budgets WHERE organization_id = $1 AND budget_code = $2', [organizationId, budgetCode]);
+    if (costCenter) await client.query('DELETE FROM enterprise_cost_centers WHERE id = $1', [costCenter.id]);
+    if (profitCenter) await client.query('DELETE FROM enterprise_profit_centers WHERE id = $1', [profitCenter.id]);
+    await client.query('DELETE FROM accounting_accounts WHERE id IN ($1, $2)', [asset.id, revenue.id]);
   }
 });

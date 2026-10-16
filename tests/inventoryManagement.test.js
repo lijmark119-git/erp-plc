@@ -48,6 +48,18 @@ after(async () => {
     [organizationId, testResources.products],
     );
     await client.query(
+    'DELETE FROM inventory_stock_reservations WHERE organization_id = $1 AND product_id = ANY($2::uuid[])',
+    [organizationId, testResources.products],
+    );
+    await client.query(
+    'DELETE FROM inventory_serial_numbers WHERE organization_id = $1 AND product_id = ANY($2::uuid[])',
+    [organizationId, testResources.products],
+    );
+    await client.query(
+    'DELETE FROM manufacturing_lots WHERE organization_id = $1 AND product_id = ANY($2::uuid[])',
+    [organizationId, testResources.products],
+    );
+    await client.query(
     'DELETE FROM inventory_audit_events WHERE organization_id = $1 AND inventory_entity_id = ANY($2::uuid[])',
     [organizationId, [...testResources.products, ...testResources.warehouses, ...testResources.locations, ...testResources.uoms]],
     );
@@ -286,6 +298,104 @@ test('failed stock movement rolls back its transaction and journal', async () =>
   assert.equal(Number(balance.quantity), 3);
   const transactions = await inventoryService.getStockTransactions(client, organizationId, { productId: fixture.product.id });
   assert.equal(transactions.filter((row) => row.reference_id === receipt.transaction.reference_id).length, 1);
+});
+
+test('lot, serial, quality, barcode lookup, and stock reservations stay in sync with stock issues', async () => {
+  const fixture = await createTestFixture();
+  const referenceId = randomUUID();
+  const lotNumber = `TRACE-${referenceId}`;
+  const received = await inventoryService.receive(client, organizationId, actorId, {
+    productId: fixture.product.id,
+    warehouseId: fixture.source.id,
+    locationId: fixture.sourceLocation.id,
+    quantity: 4,
+    unitCost: 12,
+    referenceType: 'PURCHASE_RECEIPT',
+    referenceId,
+    traceLotNumber: lotNumber,
+    expiryDate: '2035-12-31',
+    warrantyEndDate: '2036-12-31',
+    lotBarcode: `QR-${lotNumber}`,
+    serialNumbers: [`SER-${referenceId}-1`, `SER-${referenceId}-2`, `SER-${referenceId}-3`, `SER-${referenceId}-4`],
+  });
+  assert.equal(received.lot.lot_number, lotNumber);
+  assert.equal(received.lot.quality_status, 'AVAILABLE');
+  assert.equal(received.lot.location_id, fixture.sourceLocation.id);
+  assert.equal(received.serials.length, 4);
+
+  const reservation = await inventoryService.reserveStock(client, organizationId, actorId, {
+    productId: fixture.product.id,
+    warehouseId: fixture.source.id,
+    locationId: fixture.sourceLocation.id,
+    quantity: 2,
+    referenceType: 'SALES_DELIVERY',
+    referenceId,
+  });
+  await assert.rejects(() => inventoryService.issue(client, organizationId, actorId, {
+    productId: fixture.product.id, warehouseId: fixture.source.id, quantity: 2.5,
+  }), /Insufficient stock/);
+  const firstIssue = await inventoryService.issue(client, organizationId, actorId, {
+    productId: fixture.product.id,
+    warehouseId: fixture.source.id,
+    quantity: 1,
+    transactionType: 'SALES_DELIVERY',
+    referenceType: 'SALES_DELIVERY',
+    referenceId,
+  });
+  assert.equal(firstIssue.serials.length, 1);
+  assert.equal(firstIssue.transaction.location_id, fixture.sourceLocation.id);
+  const secondIssue = await inventoryService.issue(client, organizationId, actorId, {
+    productId: fixture.product.id,
+    warehouseId: fixture.source.id,
+    quantity: 1,
+    referenceId: `TRACE-ISSUE-${randomUUID()}`,
+    reservationId: reservation.id,
+  });
+  assert.equal(secondIssue.serials.length, 1);
+  assert.equal(secondIssue.serials[0].status, 'ISSUED');
+  assert.equal((await inventoryService.getStockReservations(client, organizationId))
+    .find((item) => item.id === reservation.id).status, 'FULFILLED');
+  assert.equal((await inventoryService.lookupTraceCode(client, organizationId, `QR-${lotNumber}`)).id, received.lot.id);
+  assert.equal((await inventoryService.lookupTraceCode(client, organizationId, firstIssue.serials[0].serial_number)).type, 'SERIAL');
+
+  const transfer = await inventoryService.createTransfer(client, organizationId, actorId, {
+    productId: fixture.product.id,
+    sourceWarehouseId: fixture.source.id,
+    destinationWarehouseId: fixture.destination.id,
+    sourceLocationId: fixture.sourceLocation.id,
+    destinationLocationId: fixture.destinationLocation.id,
+    requestedQuantity: 1,
+    reason: 'Move remaining serialized unit',
+  });
+  await inventoryService.approveTransfer(client, organizationId, actorId, transfer.id, 1);
+  await inventoryService.dispatchTransfer(client, organizationId, actorId, transfer.id);
+  let serialRows = await inventoryService.getSerialNumbers(client, organizationId);
+  assert.equal(serialRows.find((item) => item.serial_number === `SER-${referenceId}-3`).status, 'IN_TRANSIT');
+  await inventoryService.receiveTransfer(client, organizationId, actorId, transfer.id);
+  serialRows = await inventoryService.getSerialNumbers(client, organizationId);
+  const transferredSerial = serialRows.find((item) => item.serial_number === `SER-${referenceId}-3`);
+  assert.equal(transferredSerial.status, 'AVAILABLE');
+  assert.equal(transferredSerial.warehouse_id, fixture.destination.id);
+  assert.equal(transferredSerial.location_id, fixture.destinationLocation.id);
+
+  await inventoryService.updateLotQuality(client, organizationId, actorId, received.lot.id, {
+    qualityStatus: 'QUARANTINED',
+    reason: 'Inspection hold',
+  });
+  await assert.rejects(() => inventoryService.issue(client, organizationId, actorId, {
+    productId: fixture.product.id, warehouseId: fixture.destination.id, quantity: 1,
+  }), /Insufficient stock/);
+  const released = await inventoryService.updateLotQuality(client, organizationId, actorId, received.lot.id, {
+    qualityStatus: 'AVAILABLE',
+  });
+  assert.equal(released.quality_status, 'AVAILABLE');
+  const lotRows = await inventoryService.getTraceLots(client, organizationId);
+  assert.equal(lotRows.find((item) => item.id === received.lot.id).remaining_quantity, '2.000000');
+  const releasable = await inventoryService.reserveStock(client, organizationId, actorId, {
+    productId: fixture.product.id, warehouseId: fixture.destination.id,
+    locationId: fixture.destinationLocation.id, quantity: 1, referenceId,
+  });
+  assert.equal((await inventoryService.releaseStockReservation(client, organizationId, actorId, releasable.id)).status, 'RELEASED');
 });
 
 test('product master, uom conversions, adjustments, stock counts, valuation, and reports operate end-to-end', async () => {

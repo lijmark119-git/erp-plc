@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { accountingService } from './accountingService.js';
 import { inventoryService } from './inventoryService.js';
+import { isValidEmail, isValidISODate, isValidPersonName, isValidPhone } from '../validation.js';
 
 const quoteStatuses = new Set(['Draft', 'Submitted', 'Approved', 'Rejected', 'Expired', 'Converted']);
 const paymentMethods = new Set(['cash', 'bank', 'transfer', 'cheque', 'other']);
@@ -32,7 +33,7 @@ function amount(value, field, { min = 0, max = 100 } = {}) {
 
 function dateValue(value, field, optional = false) {
   if (optional && !value) return null;
-  if (!value || Number.isNaN(Date.parse(`${value}T00:00:00Z`))) throw new SalesError(400, `${field} must be a valid date.`);
+  if (!isValidISODate(value)) throw new SalesError(400, `${field} must be a valid calendar date in YYYY-MM-DD format.`);
   return value;
 }
 
@@ -215,6 +216,11 @@ export const salesService = {
   async createCustomer(client, organizationId, actorId, input) {
     const customerCode = requiredText(input.customerCode ?? input.customer_code, 'customerCode');
     const legalName = requiredText(input.legalName ?? input.legal_name, 'legalName');
+    if (!isValidPhone(input.phone ?? '')) throw new SalesError(400, 'Phone must contain 7 to 15 digits and only standard phone characters.');
+    const contactPerson = input.contactPerson ?? input.contact_person ?? '';
+    if ((contactPerson && !isValidPersonName(contactPerson)) || !isValidEmail(input.email ?? '')) {
+      throw new SalesError(400, 'Contact person or email has an invalid format.');
+    }
     const creditLimit = amount(input.creditLimit ?? input.credit_limit, 'creditLimit', { max: Number.MAX_SAFE_INTEGER });
     return transaction(client, async () => {
       const result = await client.query(
@@ -232,6 +238,16 @@ export const salesService = {
   },
 
   async updateCustomer(client, organizationId, actorId, customerId, input) {
+    if (input.phone !== undefined && !isValidPhone(input.phone ?? '')) {
+      throw new SalesError(400, 'Phone must contain 7 to 15 digits and only standard phone characters.');
+    }
+    const legalName = input.legalName ?? input.legal_name;
+    const contactPerson = input.contactPerson ?? input.contact_person;
+    if ((legalName !== undefined && !String(legalName).trim()) ||
+      (contactPerson !== undefined && contactPerson !== '' && !isValidPersonName(contactPerson)) ||
+      (input.email !== undefined && !isValidEmail(input.email))) {
+      throw new SalesError(400, 'Legal name, contact person, or email has an invalid format.');
+    }
     const fields = {
       customer_code: input.customerCode ?? input.customer_code,
       legal_name: input.legalName ?? input.legal_name,
@@ -670,6 +686,131 @@ export const salesService = {
         FROM accounts_receivable WHERE organization_id=$1`, [organizationId]),
     ]);
     return { summary: summary.rows[0], byCustomer: customers.rows, byProduct: products.rows, bySalesperson: salespeople.rows, byPeriod: periods.rows, receivables: receivables.rows[0] };
+  },
+
+  async listCrmRecords(client, organizationId) {
+    return (await client.query(
+      `SELECT record.*, customer.legal_name AS customer_name
+       FROM sales_crm_records record
+       LEFT JOIN customers customer ON customer.id=record.customer_id AND customer.organization_id=record.organization_id
+       WHERE record.organization_id=$1 ORDER BY record.updated_at DESC`,
+      [organizationId],
+    )).rows;
+  },
+
+  async listCustomerActivities(client, organizationId) {
+    return (await client.query(
+      `SELECT activity.*, customer.legal_name AS customer_name, record.name AS crm_record_name,
+              actor.display_name AS created_by_name
+       FROM sales_customer_activities activity
+       LEFT JOIN customers customer ON customer.id=activity.customer_id
+       LEFT JOIN sales_crm_records record ON record.id=activity.crm_record_id
+       LEFT JOIN users actor ON actor.id=activity.created_by
+       WHERE activity.organization_id=$1 ORDER BY activity.activity_date DESC LIMIT 500`,
+      [organizationId],
+    )).rows;
+  },
+
+  async createCrmRecord(client, organizationId, actorId, input) {
+    const recordType = String(input.recordType || '').toUpperCase();
+    if (!['LEAD', 'OPPORTUNITY'].includes(recordType)) throw new SalesError(400, 'recordType must be LEAD or OPPORTUNITY.');
+    const name = requiredText(input.name, 'name').slice(0, 180);
+    const customerId = input.customerId || null;
+    if (customerId) await ensureCustomer(client, organizationId, customerId);
+    const estimatedValue = amount(input.estimatedValue, 'estimatedValue', { max: Number.MAX_SAFE_INTEGER });
+    const expectedCloseDate = dateValue(input.expectedCloseDate, 'expectedCloseDate', true);
+    const result = await client.query(
+      `INSERT INTO sales_crm_records
+         (organization_id, customer_id, record_type, name, contact_name, email, phone, source, stage,
+          estimated_value, expected_close_date, notes, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [organizationId, customerId, recordType, name, input.contactName || null, input.email || null,
+        input.phone || null, input.source || null, input.stage || 'NEW', estimatedValue, expectedCloseDate,
+        input.notes || null, actorId],
+    );
+    await audit(client, organizationId, actorId, 'crm_record_created', recordType.toLowerCase(), result.rows[0].id, { name, customerId });
+    return result.rows[0];
+  },
+
+  async createCustomerActivity(client, organizationId, actorId, input) {
+    const activityType = String(input.activityType || '').toUpperCase();
+    if (!['CALL', 'EMAIL', 'MEETING', 'NOTE', 'FOLLOW_UP'].includes(activityType)) {
+      throw new SalesError(400, 'activityType must be CALL, EMAIL, MEETING, NOTE, or FOLLOW_UP.');
+    }
+    const subject = requiredText(input.subject, 'subject').slice(0, 180);
+    let customerId = input.customerId || null;
+    let crmRecordId = input.crmRecordId || null;
+    if (crmRecordId) {
+      const record = (await client.query(
+        'SELECT customer_id FROM sales_crm_records WHERE id=$1 AND organization_id=$2',
+        [crmRecordId, organizationId],
+      )).rows[0];
+      if (!record) throw new SalesError(404, 'CRM lead or opportunity not found.');
+      customerId ||= record.customer_id;
+    }
+    if (customerId) await ensureCustomer(client, organizationId, customerId);
+    if (!customerId && !crmRecordId) throw new SalesError(400, 'customerId or crmRecordId is required.');
+    const followUp = dateValue(input.nextFollowUp, 'nextFollowUp', true);
+    const result = await client.query(
+      `INSERT INTO sales_customer_activities
+         (organization_id, customer_id, crm_record_id, activity_type, subject, details, next_follow_up, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [organizationId, customerId, crmRecordId, activityType, subject, input.details || null, followUp, actorId],
+    );
+    await audit(client, organizationId, actorId, 'customer_activity_recorded', 'customer_activity', result.rows[0].id, { subject, activityType });
+    return result.rows[0];
+  },
+
+  async listReceivableDisputes(client, organizationId) {
+    return (await client.query(
+      `SELECT dispute.*, ar.invoice_id, ar.outstanding, ar.due_date, invoice.invoice_number,
+              customer.legal_name AS customer_name
+       FROM sales_receivable_disputes dispute
+       JOIN accounts_receivable ar ON ar.id=dispute.receivable_id AND ar.organization_id=dispute.organization_id
+       JOIN customer_invoices invoice ON invoice.id=ar.invoice_id
+       JOIN customers customer ON customer.id=ar.customer_id
+       WHERE dispute.organization_id=$1 ORDER BY dispute.created_at DESC`,
+      [organizationId],
+    )).rows;
+  },
+
+  async createReceivableDispute(client, organizationId, actorId, input) {
+    const receivableId = requiredText(input.receivableId, 'receivableId');
+    const reason = requiredText(input.reason, 'reason').slice(0, 240);
+    const receivable = (await client.query(
+      'SELECT id FROM accounts_receivable WHERE id=$1 AND organization_id=$2 AND outstanding > 0',
+      [receivableId, organizationId],
+    )).rows[0];
+    if (!receivable) throw new SalesError(404, 'Open receivable not found.');
+    const result = await client.query(
+      `INSERT INTO sales_receivable_disputes (organization_id, receivable_id, reason, created_by)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [organizationId, receivableId, reason, actorId],
+    );
+    await audit(client, organizationId, actorId, 'receivable_dispute_opened', 'receivable_dispute', result.rows[0].id, { receivableId, reason });
+    return result.rows[0];
+  },
+
+  async updateReceivableDispute(client, organizationId, actorId, disputeId, status, resolution) {
+    const nextStatus = String(status || '').toUpperCase();
+    if (!['UNDER_REVIEW', 'RESOLVED', 'REJECTED'].includes(nextStatus)) {
+      throw new SalesError(400, 'status must be UNDER_REVIEW, RESOLVED, or REJECTED.');
+    }
+    if (['RESOLVED', 'REJECTED'].includes(nextStatus) && !String(resolution || '').trim()) {
+      throw new SalesError(400, 'A resolution note is required to close a dispute.');
+    }
+    const result = await client.query(
+      `UPDATE sales_receivable_disputes
+       SET status=$1::varchar, resolution=COALESCE(NULLIF($2::text,''), resolution),
+           resolved_by=CASE WHEN $1::varchar IN ('RESOLVED','REJECTED') THEN $3 ELSE resolved_by END,
+           updated_at=CURRENT_TIMESTAMP
+       WHERE id=$4 AND organization_id=$5 AND status IN ('OPEN','UNDER_REVIEW')
+       RETURNING *`,
+      [nextStatus, String(resolution || '').trim(), actorId, disputeId, organizationId],
+    );
+    if (!result.rows[0]) throw new SalesError(409, 'Open receivable dispute not found or already closed.');
+    await audit(client, organizationId, actorId, 'receivable_dispute_updated', 'receivable_dispute', disputeId, { status: nextStatus });
+    return result.rows[0];
   },
 
   async listAudit(client, organizationId) {

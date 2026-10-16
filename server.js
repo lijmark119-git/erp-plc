@@ -1,4 +1,5 @@
 import express from 'express';
+import QRCode from 'qrcode';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -6,15 +7,18 @@ import { fileURLToPath } from 'node:url';
 import { createSessionToken, hashPassword, verifyPassword, verifySessionToken } from './auth.js';
 import { DEFAULT_ROLE_PERMISSIONS, hasPermission } from './authorization.js';
 import { checkDatabaseConnection, createDatabasePool, loadEnvironmentFile } from './database.js';
+import { isValidBusinessCode, isValidEmail, isValidEmployeeNumber, isValidGender, isValidISODate, isValidNationalId, isValidPersonName, isValidPhone } from './validation.js';
 import { migrateDatabase } from './scripts/migrate.js';
 import { getDashboardData, getDashboardRangeDays } from './repositories/dashboardRepository.js';
+import { createGovernanceRecord, getGovernanceWorkspace, updateGovernanceStatus } from './repositories/governanceRepository.js';
 import { getHrWorkspace, updateHrWorkspace } from './repositories/hrWorkspaceRepository.js';
 import { findUserByLogin, getUserById, getUserPermissions } from './repositories/userRepository.js';
 import { accountingService } from './services/accountingService.js';
 import { inventoryService } from './services/inventoryService.js';
 import { ManufacturingError, manufacturingService } from './services/manufacturingService.js';
-import { ProcurementError, createComparison, createPurchaseOrder, createSupplier, decidePurchaseOrder, getProcurementWorkspace, receivePurchaseOrder, selectComparisonQuote } from './services/procurementService.js';
+import { ProcurementError, createComparison, createPurchaseOrder, createPurchaseRequisition, createSupplier, createSupplierInvoice, decidePurchaseOrder, decidePurchaseRequisition, getProcurementWorkspace, matchSupplierInvoice, receivePurchaseOrder, selectComparisonQuote } from './services/procurementService.js';
 import { SalesError, salesService } from './services/salesService.js';
+import { GovernanceValidationError } from './services/governanceService.js';
 import { autoMatchTransactions } from './services/bankReconciliation.js';
 import {
   approveFinanceTransaction,
@@ -343,6 +347,30 @@ function requireAnyPermission(permissions) {
   };
 }
 
+function governanceRoute(permission, handler) {
+  return [
+    requirePermission(permission),
+    async (req, res) => {
+      if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+      let client;
+      try {
+        client = await databasePool.connect();
+        const organizationId = req.user.organization_id || req.user.organizationId;
+        const result = await handler(client, organizationId, req.user.id, req);
+        return res.status(result?.statusCode || 200).json(result?.body ?? result);
+      } catch (error) {
+        if (error instanceof GovernanceValidationError) return res.status(400).json({ error: error.message });
+        if (error.code === '23505') return res.status(409).json({ error: 'A governance record with that code already exists.' });
+        if (error.code === '23503') return res.status(400).json({ error: 'A referenced governance record does not exist in this company.' });
+        console.error('Governance route error:', error);
+        return res.status(500).json({ error: 'Unable to complete the governance request.' });
+      } finally {
+        client?.release();
+      }
+    },
+  ];
+}
+
 function setSessionCookie(res, user) {
   const token = createSessionToken({ userId: user.id, role: user.role }, SESSION_SECRET, SESSION_TTL_SECONDS);
   const secureFlag = process.env.NODE_ENV === 'production' ? '; Secure' : '';
@@ -361,7 +389,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
   }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   return next();
@@ -446,6 +474,19 @@ app.post('/api/logout', (_req, res) => {
 });
 
 app.use('/api', requireAuth);
+
+app.get('/api/governance', ...governanceRoute('governance:read', async (client, organizationId) => (
+  getGovernanceWorkspace(client, organizationId)
+)));
+
+app.post('/api/governance/:collection', ...governanceRoute('governance:manage', async (client, organizationId, actorId, req) => ({
+  statusCode: 201,
+  body: await createGovernanceRecord(client, organizationId, actorId, req.params.collection, req.body),
+})));
+
+app.patch('/api/governance/:collection/:id/status', ...governanceRoute('governance:manage', async (client, organizationId, actorId, req) => (
+  updateGovernanceStatus(client, organizationId, actorId, req.params.collection, req.params.id, req.body || {})
+)));
 
 function accessUserPayload(user) {
   return {
@@ -814,14 +855,30 @@ app.post('/api/employees', ...hrRoute('hr:employees:create', true, (workspace, _
   const required = ['employeeNumber', 'firstName', 'lastName', 'departmentId', 'positionId', 'employmentType', 'hireDate', 'contract', 'salary', 'status'];
   const missing = required.filter((field) => body[field] === undefined || body[field] === null || body[field] === '');
   if (missing.length) throw new HrRouteError(400, `${missing.join(', ')} are required`);
-  if (workspace.employees.some((employee) => employee.employeeNumber === body.employeeNumber)) {
+  const employeeNumber = String(body.employeeNumber).trim();
+  if (!isValidEmployeeNumber(employeeNumber)) throw new HrRouteError(400, 'Employee number must contain digits only');
+  if (!isValidPersonName(body.firstName) || !isValidPersonName(body.lastName) ||
+    (body.emergencyName && !isValidPersonName(body.emergencyName))) {
+    throw new HrRouteError(400, 'Names must contain letters, spaces, apostrophes, periods, or hyphens only');
+  }
+  if ((body.gender && !isValidGender(body.gender)) || (body.nationalId && !isValidNationalId(body.nationalId)) ||
+    !isValidEmail(body.email ?? '')) {
+    throw new HrRouteError(400, 'Gender, National ID, or email has an invalid format');
+  }
+  if (!isValidISODate(body.hireDate) || (body.dateOfBirth && !isValidISODate(body.dateOfBirth))) {
+    throw new HrRouteError(400, 'hireDate and dateOfBirth must be valid calendar dates');
+  }
+  if (!isValidPhone(body.phone ?? '') || !isValidPhone(body.emergencyPhone ?? '')) {
+    throw new HrRouteError(400, 'Phone numbers must contain 7 to 15 digits and only standard phone characters');
+  }
+  if (workspace.employees.some((employee) => employee.employeeNumber === employeeNumber)) {
     throw new HrRouteError(409, 'Employee number already exists.');
   }
   const salary = Number(body.salary);
   if (!Number.isFinite(salary) || salary < 0) throw new HrRouteError(400, 'salary must be a non-negative number');
   const employee = {
     id: randomUUID(),
-    employeeNumber: String(body.employeeNumber).trim(),
+    employeeNumber,
     personal: {
       firstName: String(body.firstName).trim(),
       lastName: String(body.lastName).trim(),
@@ -857,7 +914,31 @@ app.put('/api/hr/employees/:employeeId', ...hrRoute('hr:employees:manage', true,
   const employee = workspace.employees.find((item) => item.id === req.params.employeeId);
   if (!employee) throw new HrRouteError(404, 'Employee not found');
   const body = req.body || {};
-  if (body.employeeNumber && workspace.employees.some((item) => item.id !== employee.id && item.employeeNumber === body.employeeNumber)) {
+  if (body.employeeNumber !== undefined) {
+    const employeeNumber = String(body.employeeNumber).trim();
+    if (employeeNumber !== employee.employeeNumber && !isValidEmployeeNumber(employeeNumber)) {
+      throw new HrRouteError(400, 'Employee number must contain digits only');
+    }
+  }
+  if ((body.firstName !== undefined && !isValidPersonName(body.firstName)) ||
+    (body.lastName !== undefined && !isValidPersonName(body.lastName)) ||
+    (body.emergencyName !== undefined && body.emergencyName !== '' && !isValidPersonName(body.emergencyName))) {
+    throw new HrRouteError(400, 'Names must contain letters, spaces, apostrophes, periods, or hyphens only');
+  }
+  if ((body.gender !== undefined && body.gender !== employee.personal.gender && body.gender !== '' && !isValidGender(body.gender)) ||
+    (body.nationalId !== undefined && body.nationalId !== employee.personal.nationalId && body.nationalId !== '' && !isValidNationalId(body.nationalId)) ||
+    (body.email !== undefined && body.email !== employee.contact.email && !isValidEmail(body.email))) {
+    throw new HrRouteError(400, 'Gender, National ID, or email has an invalid format');
+  }
+  if ((body.hireDate !== undefined && !isValidISODate(body.hireDate)) ||
+    (body.dateOfBirth && !isValidISODate(body.dateOfBirth))) {
+    throw new HrRouteError(400, 'hireDate and dateOfBirth must be valid calendar dates');
+  }
+  if ((body.phone !== undefined && !isValidPhone(body.phone)) ||
+    (body.emergencyPhone !== undefined && !isValidPhone(body.emergencyPhone))) {
+    throw new HrRouteError(400, 'Phone numbers must contain 7 to 15 digits and only standard phone characters');
+  }
+  if (body.employeeNumber !== undefined && workspace.employees.some((item) => item.id !== employee.id && item.employeeNumber === String(body.employeeNumber).trim())) {
     throw new HrRouteError(409, 'Employee number already exists.');
   }
   const salary = body.salary === undefined ? employee.salary : Number(body.salary);
@@ -871,15 +952,15 @@ app.put('/api/hr/employees/:employeeId', ...hrRoute('hr:employees:manage', true,
     address: 'address',
   };
   for (const [field, key] of Object.entries(nameFieldMap)) {
-    if (body[field] !== undefined) employee.personal[key] = String(body[field]);
+    if (body[field] !== undefined) employee.personal[key] = String(body[field]).trim();
   }
   if (body.email !== undefined) employee.contact.email = String(body.email);
   if (body.phone !== undefined) employee.contact.phone = String(body.phone);
-  if (body.emergencyName !== undefined) employee.emergencyContact.name = String(body.emergencyName);
+  if (body.emergencyName !== undefined) employee.emergencyContact.name = String(body.emergencyName).trim();
   if (body.emergencyPhone !== undefined) employee.emergencyContact.phone = String(body.emergencyPhone);
   if (body.emergencyRelationship !== undefined) employee.emergencyContact.relationship = String(body.emergencyRelationship);
   for (const field of ['employeeNumber', 'departmentId', 'positionId', 'employmentType', 'hireDate', 'contract', 'status']) {
-    if (body[field] !== undefined) employee[field] = body[field];
+    if (body[field] !== undefined) employee[field] = field === 'employeeNumber' ? String(body[field]).trim() : body[field];
   }
   for (const field of ['allowances', 'advanceDeduction', 'otherDeductions']) {
     if (body[field] !== undefined) {
@@ -917,6 +998,7 @@ app.post('/api/hr/positions', ...hrRoute('hr:organizations:manage', true, (works
 app.post('/api/hr/branches', ...hrRoute('hr:organizations:manage', true, (workspace, _client, req) => {
   const { name, code, city, country = 'Ethiopia', phone = '', managerId = null } = req.body || {};
   if (!name || !code || !city) throw new HrRouteError(400, 'name, code, and city are required');
+  if (!isValidPhone(phone)) throw new HrRouteError(400, 'Phone numbers must contain 7 to 15 digits and only standard phone characters');
   if (workspace.branches.some((item) => item.code.toLowerCase() === String(code).toLowerCase())) throw new HrRouteError(409, 'Branch code already exists.');
   const branch = { id: randomUUID(), name: String(name).trim(), code: String(code).trim(), city: String(city).trim(), country, phone, managerId };
   workspace.branches.push(branch);
@@ -1011,7 +1093,7 @@ app.post('/api/hr/leave/requests', ...hrRoute('hr:leave:manage', true, (workspac
   const employee = workspace.employees.find((item) => item.id === employeeId);
   const leaveType = workspace.leaveTypes.find((item) => item.id === leaveTypeId);
   if (!employee || !leaveType) throw new HrRouteError(404, 'Employee or leave type not found');
-  if (!startDate || !endDate || Number.isNaN(Date.parse(startDate)) || Number.isNaN(Date.parse(endDate)) || endDate < startDate) {
+  if (!isValidISODate(startDate) || !isValidISODate(endDate) || endDate < startDate) {
     throw new HrRouteError(400, 'A valid startDate and endDate are required');
   }
   if (workspace.leaveRequests.some((item) => item.employeeId === employeeId && item.status !== 'Rejected' &&
@@ -1097,7 +1179,7 @@ app.get('/api/hr/payroll', ...hrRoute('hr:payroll:read', false, (workspace) => (
 })));
 app.post('/api/hr/payroll/periods', ...hrRoute('hr:payroll:calculate', true, (workspace, _client, req) => {
   const { label, startDate, endDate } = req.body || {};
-  if (!label || !startDate || !endDate || Number.isNaN(Date.parse(startDate)) || Number.isNaN(Date.parse(endDate)) || endDate < startDate) {
+  if (!label || !isValidISODate(startDate) || !isValidISODate(endDate) || endDate < startDate) {
     throw new HrRouteError(400, 'label, valid startDate, and valid endDate are required');
   }
   if (workspace.payrollPeriods.some((period) => period.startDate === startDate && period.endDate === endDate)) {
@@ -1504,19 +1586,21 @@ app.post('/api/manufacturing/orders', requirePermission('manufacturing:orders:cr
   const { product, quantity, dueDate, workCenter, priority = 'Normal' } = req.body || {};
   const numericQuantity = Number(quantity);
 
-  if (!product || !Number.isInteger(numericQuantity) || numericQuantity <= 0 || !dueDate || !workCenter) {
+  if (typeof product !== 'string' || !product.trim() || !Number.isInteger(numericQuantity) || numericQuantity <= 0 ||
+    !isValidISODate(dueDate) || typeof workCenter !== 'string' || !workCenter.trim() ||
+    !['Normal', 'High', 'Critical'].includes(priority)) {
     return res.status(400).json({ error: 'product, positive integer quantity, dueDate, and workCenter are required' });
   }
 
   const order = {
     id: `MO-${Date.now()}`,
-    product,
+    product: product.trim(),
     quantity: numericQuantity,
     completed: 0,
     dueDate,
-    workCenter,
+    workCenter: workCenter.trim(),
     status: 'Scheduled',
-    priority: ['Normal', 'High', 'Critical'].includes(priority) ? priority : 'Normal',
+    priority,
   };
 
   store.productionOrders.unshift(order);
@@ -1566,17 +1650,19 @@ app.post('/api/settings/:name/toggle', requirePermission('settings:toggle'), (re
 app.post('/api/sales', requirePermission('sales:orders:create'), (req, res) => {
   const store = ensureStore();
   const { customer, date, amount, status = 'Pending' } = req.body || {};
-
-  if (!customer || !amount) {
-    return res.status(400).json({ error: 'customer and amount are required' });
+  const numericAmount = Number(amount);
+  const transactionDate = date || new Date().toISOString().slice(0, 10);
+  if (typeof customer !== 'string' || !customer.trim() || !Number.isFinite(numericAmount) || numericAmount <= 0 ||
+    !isValidISODate(transactionDate) || !['Pending', 'Processing', 'Paid'].includes(status)) {
+    return res.status(400).json({ error: 'customer, valid date, positive amount, and valid status are required' });
   }
 
   const newOrder = {
     id: `SO-${Date.now()}`,
-    customer,
-    date: date || new Date().toISOString().slice(0, 10),
+    customer: customer.trim(),
+    date: transactionDate,
     status,
-    amount: Number(amount),
+    amount: numericAmount,
   };
 
   store.salesOrders.unshift(newOrder);
@@ -1629,6 +1715,14 @@ function procurementRoute(permission, write, handler, successStatus = 200) {
 
 app.get('/api/procurement/workspace', ...procurementRoute('procurement:comparisons:read', false,
   (client, organizationId) => getProcurementWorkspace(client, organizationId)));
+app.post('/api/procurement/requisitions', ...procurementRoute('procurement:orders:create', true,
+  (client, organizationId, actorId, req) => createPurchaseRequisition(client, organizationId, actorId, req.body || {}), 201));
+app.post('/api/procurement/requisitions/:requisitionId/decision', ...procurementRoute('procurement:orders:approve', true,
+  (client, organizationId, actorId, req) => decidePurchaseRequisition(client, organizationId, actorId, req.params.requisitionId, req.body?.decision, req.body?.reason)));
+app.post('/api/procurement/supplier-invoices', ...procurementRoute('procurement:orders:receive', true,
+  (client, organizationId, actorId, req) => createSupplierInvoice(client, organizationId, actorId, req.body || {}), 201));
+app.post('/api/procurement/supplier-invoices/:invoiceId/match', ...procurementRoute('procurement:orders:approve', true,
+  (client, organizationId, actorId, req) => matchSupplierInvoice(client, organizationId, actorId, req.params.invoiceId)));
 app.post('/api/procurement/suppliers', ...procurementRoute('procurement:suppliers:manage', true,
   (client, organizationId, actorId, req) => createSupplier(client, organizationId, actorId, req.body || {}), 201));
 app.post('/api/procurement/comparisons', ...procurementRoute('procurement:comparisons:create', true,
@@ -1670,6 +1764,9 @@ function accountingRoute(permission, write, handler, successStatus = 200) {
 }
 
 app.get('/api/accounting/accounts', ...accountingRoute('accounting:reports:view', false, (client, organizationId) => accountingService.getAccounts(client, organizationId)));
+app.get('/api/accounting/budgets', ...accountingRoute('accounting:reports:view', false, (client, organizationId) => accountingService.getBudgetWorkspace(client, organizationId)));
+app.post('/api/accounting/budgets/lines', ...accountingRoute('accounting:budgets:manage', true,
+  (client, organizationId, actorId, req) => accountingService.saveBudgetLine(client, organizationId, actorId, req.body || {}), 201));
 app.post('/api/accounting/accounts', ...accountingRoute('accounting:accounts:manage', true, (client, organizationId, actorId, req) => accountingService.createAccount(client, organizationId, actorId, req.body || {}), 201));
 app.put('/api/accounting/accounts/:accountId', ...accountingRoute('accounting:accounts:manage', true, (client, organizationId, actorId, req) => accountingService.updateAccount(client, organizationId, actorId, req.params.accountId, req.body || {})));
 app.get('/api/accounting/periods', ...accountingRoute('accounting:reports:view', false, (client, organizationId) => accountingService.getPeriods(client, organizationId)));
@@ -1778,6 +1875,9 @@ app.post('/api/manufacturing/work-orders/:orderId/close', ...manufacturingRoute(
 app.post('/api/manufacturing/lots/raw', ...manufacturingRoute('manufacturing:materials:consume', (client, organizationId, actorId, req) => manufacturingService.registerRawLot(client, organizationId, actorId, req.body || {}), 201));
 app.get('/api/manufacturing/lots/:lotNumber/trace', ...manufacturingRoute('manufacturing:reports:read', (client, organizationId, _actorId, req) => manufacturingService.traceLot(client, organizationId, req.params.lotNumber)));
 app.post('/api/manufacturing/mrp/run', ...manufacturingRoute('manufacturing:mrp:run', (client, organizationId, actorId, req) => manufacturingService.runMrp(client, organizationId, actorId, req.body || {}), 201));
+app.post('/api/manufacturing/forecasts', ...manufacturingRoute('manufacturing:mrp:run', (client, organizationId, actorId, req) => manufacturingService.createDemandForecast(client, organizationId, actorId, req.body || {}), 201));
+app.post('/api/manufacturing/maintenance', ...manufacturingRoute('manufacturing:routing:manage', (client, organizationId, actorId, req) => manufacturingService.createMaintenanceEvent(client, organizationId, actorId, req.body || {}), 201));
+app.post('/api/manufacturing/maintenance/:eventId/complete', ...manufacturingRoute('manufacturing:routing:manage', (client, organizationId, actorId, req) => manufacturingService.completeMaintenanceEvent(client, organizationId, actorId, req.params.eventId, req.body?.downtimeMinutes)));
 app.get('/api/manufacturing/mrp/latest', ...manufacturingRoute('manufacturing:reports:read', (client, organizationId) => manufacturingService.runMrpReport(client, organizationId, 'mrp')));
 app.post('/api/manufacturing/mrp/open-supply', ...manufacturingRoute('manufacturing:mrp:run', (client, organizationId, actorId, req) => manufacturingService.createOpenPurchaseSupply(client, organizationId, actorId, req.body || {}), 201));
 app.put('/api/manufacturing/mrp/open-supply/:supplyId/receive', ...manufacturingRoute('manufacturing:mrp:run', (client, organizationId, actorId, req) => manufacturingService.updatePurchaseSupplyReceipt(client, organizationId, actorId, req.params.supplyId, req.body?.receivedQuantity)));
@@ -1835,19 +1935,43 @@ app.post('/api/sales/payments', ...salesRoute('sales:payments:create', async (cl
 })));
 app.get('/api/sales/receivables', ...salesRoute('sales:receivables:read', (client, organizationId) => salesService.listReceivables(client, organizationId)));
 app.get('/api/sales/reports', ...salesRoute('sales:reports:read', (client, organizationId, _actorId, req) => salesService.salesReports(client, organizationId, req.query)));
+app.get('/api/sales/crm', ...salesRoute('sales:customers:read', async (client, organizationId) => {
+  const [records, activities] = await Promise.all([
+    salesService.listCrmRecords(client, organizationId),
+    salesService.listCustomerActivities(client, organizationId),
+  ]);
+  return { records, activities };
+}));
+app.post('/api/sales/crm', ...salesRoute('sales:customers:manage', async (client, organizationId, actorId, req) => ({
+  httpStatus: 201, payload: await salesService.createCrmRecord(client, organizationId, actorId, req.body || {}),
+})));
+app.post('/api/sales/activities', ...salesRoute('sales:customers:manage', async (client, organizationId, actorId, req) => ({
+  httpStatus: 201, payload: await salesService.createCustomerActivity(client, organizationId, actorId, req.body || {}),
+})));
+app.get('/api/sales/disputes', ...salesRoute('sales:receivables:read', (client, organizationId) => salesService.listReceivableDisputes(client, organizationId)));
+app.post('/api/sales/disputes', ...salesRoute('sales:customers:manage', async (client, organizationId, actorId, req) => ({
+  httpStatus: 201, payload: await salesService.createReceivableDispute(client, organizationId, actorId, req.body || {}),
+})));
+app.post('/api/sales/disputes/:disputeId/status', ...salesRoute('sales:customers:manage', (client, organizationId, actorId, req) => salesService.updateReceivableDispute(
+  client, organizationId, actorId, req.params.disputeId, req.body?.status, req.body?.resolution,
+)));
 app.get('/api/sales/audit', ...salesRoute('audit:read', (client, organizationId) => salesService.listAudit(client, organizationId)));
 
 app.post('/api/inventory/:sku/restock', requirePermission('inventory:stock:update'), (req, res) => {
   const store = ensureStore();
   const { quantity = 0 } = req.body || {};
+  const numericQuantity = Number(quantity);
   const sku = req.params.sku;
 
   const item = store.inventoryItems.find((entry) => entry.sku === sku);
   if (!item) {
     return res.status(404).json({ error: 'Inventory item not found' });
   }
+  if (!Number.isInteger(numericQuantity) || numericQuantity <= 0) {
+    return res.status(400).json({ error: 'quantity must be a positive whole number' });
+  }
 
-  item.stock += Number(quantity);
+  item.stock += numericQuantity;
   saveStore(store);
   return res.json(item);
 });
@@ -1945,17 +2069,16 @@ app.post('/api/inventory-management/stock/receive', requirePermission('inventory
   try {
     const organizationId = req.user.organization_id || req.user.organizationId;
     await client.query('BEGIN');
-    const result = await inventoryService.receive(client, organizationId, req.user.id, { ...(req.body || {}), postToLedger: true, manageTransaction: false });
-    const lot = req.body?.lotNumber
-      ? await manufacturingService.registerRawLot(client, organizationId, req.user.id, {
-        inventoryTransactionId: result.transaction.id,
-        lotNumber: req.body.lotNumber,
-        quantity: req.body.lotQuantity ?? result.transaction.quantity,
-        manageTransaction: false,
-      })
-      : null;
+    const body = req.body || {};
+    const result = await inventoryService.receive(client, organizationId, req.user.id, {
+      ...body,
+      traceLotNumber: body.traceLotNumber || body.lotNumber,
+      traceLotQuantity: body.traceLotQuantity ?? body.lotQuantity,
+      postToLedger: true,
+      manageTransaction: false,
+    });
     await client.query('COMMIT');
-    return res.status(201).json({ ...result, lot });
+    return res.status(201).json(result);
   } catch (error) {
     await client.query('ROLLBACK');
     return res.status(error.status || 400).json({ error: error.message });
@@ -1968,6 +2091,82 @@ app.post('/api/inventory-management/stock/issue', requirePermission('inventory:s
   const client = await databasePool.connect();
   try { return res.status(201).json(await inventoryService.issue(client, req.user.organizationId, req.user.id, { ...(req.body || {}), postToLedger: true })); }
   catch (error) { return res.status(400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.get('/api/inventory-management/trace/lots', requirePermission('inventory:reports:view'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try { return res.json(await inventoryService.getTraceLots(client, req.user.organizationId)); }
+  catch (error) { return res.status(400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.get('/api/inventory-management/trace/serials', requirePermission('inventory:reports:view'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try { return res.json(await inventoryService.getSerialNumbers(client, req.user.organizationId)); }
+  catch (error) { return res.status(400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.get('/api/inventory-management/trace/lookup', requirePermission('inventory:reports:view'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try {
+    const result = await inventoryService.lookupTraceCode(client, req.user.organizationId, req.query.code);
+    return result ? res.json(result) : res.status(404).json({ error: 'No product, lot, or serial matches this scan code.' });
+  } catch (error) { return res.status(400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.get('/api/inventory-management/trace/qr', requirePermission('inventory:reports:view'), async (req, res) => {
+  const code = String(req.query.code || '').trim();
+  if (!code || code.length > 128) return res.status(400).json({ error: 'A scan code of 1 to 128 characters is required.' });
+  try {
+    const image = await QRCode.toBuffer(code, { type: 'png', errorCorrectionLevel: 'M', margin: 2, width: 240 });
+    res.type('png').set('Cache-Control', 'private, no-store');
+    return res.send(image);
+  } catch (error) {
+    return res.status(400).json({ error: `QR label could not be generated: ${error.message}` });
+  }
+});
+
+app.post('/api/inventory-management/trace/lots/:id/quality', requirePermission('inventory:adjustments:approve'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try {
+    const result = await inventoryService.updateLotQuality(
+      client, req.user.organizationId, req.user.id, req.params.id, req.body || {},
+    );
+    return result ? res.json(result) : res.status(404).json({ error: 'Inventory lot not found.' });
+  } catch (error) { return res.status(error.status || 400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.get('/api/inventory-management/reservations', requirePermission('inventory:reports:view'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try { return res.json(await inventoryService.getStockReservations(client, req.user.organizationId, req.query.status || null)); }
+  catch (error) { return res.status(400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.post('/api/inventory-management/reservations', requirePermission('inventory:stock:update'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try { return res.status(201).json(await inventoryService.reserveStock(client, req.user.organizationId, req.user.id, req.body || {})); }
+  catch (error) { return res.status(error.status || 400).json({ error: error.message }); }
+  finally { client.release(); }
+});
+
+app.post('/api/inventory-management/reservations/:id/release', requirePermission('inventory:stock:update'), async (req, res) => {
+  if (!databasePool) return res.status(503).json({ error: 'Database is unavailable.' });
+  const client = await databasePool.connect();
+  try {
+    const result = await inventoryService.releaseStockReservation(client, req.user.organizationId, req.user.id, req.params.id);
+    return result ? res.json(result) : res.status(404).json({ error: 'Active inventory reservation not found.' });
+  } catch (error) { return res.status(error.status || 400).json({ error: error.message }); }
   finally { client.release(); }
 });
 
@@ -2261,7 +2460,7 @@ app.post('/api/hr/attendance/check-out/:employeeId', requirePermission('hr:atten
 app.post('/api/hr/attendance/absence', requirePermission('hr:attendance:manage'), (req, res) => {
   const store = ensureStore();
   const { employeeId, date, reason = '' } = req.body || {};
-  if (!employeeId || !date) return res.status(400).json({ error: 'employeeId and date are required' });
+  if (!employeeId || !isValidISODate(date)) return res.status(400).json({ error: 'employeeId and a valid date are required' });
   if (!store.employees.some((employee) => employee.id === employeeId)) return res.status(404).json({ error: 'Employee not found' });
   const existing = store.attendanceRecords.find((record) => record.employeeId === employeeId && record.date === date);
   if (existing) return res.status(409).json({ error: 'Attendance record already exists for this date' });
@@ -2275,10 +2474,11 @@ app.post('/api/procurement', requirePermission('procurement:orders:create'), (re
   const store = ensureStore();
   const { vendor, eta, amount, status = 'Pending' } = req.body || {};
   const numericAmount = Number(amount);
-  if (!vendor || !eta || !Number.isFinite(numericAmount) || numericAmount <= 0) {
-    return res.status(400).json({ error: 'vendor, eta, and positive amount are required' });
+  if (typeof vendor !== 'string' || !vendor.trim() || !isValidISODate(eta) || !Number.isFinite(numericAmount) || numericAmount <= 0 ||
+    !['Pending', 'In Transit'].includes(status)) {
+    return res.status(400).json({ error: 'vendor, valid eta, positive amount, and valid status are required' });
   }
-  const order = { po: `PO-${Date.now()}`, vendor, eta, status, amount: numericAmount };
+  const order = { po: `PO-${Date.now()}`, vendor: vendor.trim(), eta, status, amount: numericAmount };
   store.purchaseOrders.unshift(order);
   saveStore(store);
   return res.status(201).json(order);
@@ -2313,10 +2513,11 @@ app.post('/api/finance', requirePermission('finance:transactions:create'), (req,
   const store = ensureStore();
   const { title, type, date, amount } = req.body || {};
   const numericAmount = Number(amount);
-  if (!title || !['Revenue', 'Expense'].includes(type) || !date || !Number.isFinite(numericAmount) || numericAmount <= 0) {
+  if (typeof title !== 'string' || !title.trim() || !['Revenue', 'Expense'].includes(type) || !isValidISODate(date) ||
+    !Number.isFinite(numericAmount) || numericAmount <= 0) {
     return res.status(400).json({ error: 'title, type, date, and positive amount are required' });
   }
-  const entry = { title, type, date, amount: type === 'Expense' ? -numericAmount : numericAmount };
+  const entry = { title: title.trim(), type, date, amount: type === 'Expense' ? -numericAmount : numericAmount };
   store.financeLedger.unshift(entry);
   saveStore(store);
   return res.status(201).json(entry);
@@ -2345,24 +2546,24 @@ function recordCrudRoutes(module, collection, identifierField, permission, valid
 }
 
 recordCrudRoutes('sales', 'salesOrders', 'id', 'sales:orders:manage', (record) => {
-  if (!record.customer || !record.date || !Number.isFinite(Number(record.amount)) || Number(record.amount) <= 0) return 'customer, date, and positive amount are required';
+  if (typeof record.customer !== 'string' || !record.customer.trim() || !isValidISODate(record.date) || !Number.isFinite(Number(record.amount)) || Number(record.amount) <= 0) return 'customer, valid date, and positive amount are required';
   if (!['Pending', 'Processing', 'Paid', 'Cancelled'].includes(record.status)) return 'Invalid sales status';
 });
 recordCrudRoutes('inventory', 'inventoryItems', 'sku', 'inventory:products:manage', (record) => {
-  if (!record.sku || !record.name || !Number.isFinite(Number(record.stock)) || Number(record.stock) < 0 || !Number.isFinite(Number(record.reorderLevel)) || Number(record.reorderLevel) < 0) return 'sku, name, stock, and reorder level are required';
+  if (!isValidBusinessCode(record.sku, 80) || typeof record.name !== 'string' || !record.name.trim() || record.name.trim().length > 240 || !Number.isFinite(Number(record.stock)) || Number(record.stock) < 0 || !Number.isFinite(Number(record.reorderLevel)) || Number(record.reorderLevel) < 0) return 'sku, name, non-negative stock, and non-negative reorder level are required';
 });
 recordCrudRoutes('procurement', 'purchaseOrders', 'po', 'procurement:orders:manage', (record) => {
-  if (!record.vendor || !record.eta || !Number.isFinite(Number(record.amount)) || Number(record.amount) <= 0) return 'vendor, eta, and positive amount are required';
+  if (typeof record.vendor !== 'string' || !record.vendor.trim() || !isValidISODate(record.eta) || !Number.isFinite(Number(record.amount)) || Number(record.amount) <= 0) return 'vendor, valid eta, and positive amount are required';
 });
 recordCrudRoutes('manufacturing', 'productionOrders', 'id', 'manufacturing:orders:manage', (record) => {
-  if (!record.product || !record.dueDate || !record.workCenter || !Number.isInteger(Number(record.quantity)) || Number(record.quantity) <= 0) return 'product, due date, work center, and positive quantity are required';
+  if (typeof record.product !== 'string' || !record.product.trim() || !isValidISODate(record.dueDate) || typeof record.workCenter !== 'string' || !record.workCenter.trim() || !Number.isInteger(Number(record.quantity)) || Number(record.quantity) <= 0) return 'product, valid due date, work center, and positive integer quantity are required';
 });
 recordCrudRoutes('hr', 'employees', 'id', 'hr:employees:manage', (record) => {
   if (!record.employeeNumber || !record.personal?.firstName || !record.personal?.lastName || !record.departmentId || !record.positionId) return 'employee number, personal details, department, and position are required';
   if (!Number.isFinite(Number(record.salary)) || Number(record.salary) < 0) return 'salary must be a non-negative number';
 });
 recordCrudRoutes('finance', 'financeLedger', 'title', 'finance:transactions:manage', (record) => {
-  if (!record.title || !['Revenue', 'Expense'].includes(record.type) || !record.date || !Number.isFinite(Number(record.amount))) return 'title, type, date, and amount are required';
+  if (typeof record.title !== 'string' || !record.title.trim() || !['Revenue', 'Expense'].includes(record.type) || !isValidISODate(record.date) || !Number.isFinite(Number(record.amount)) || Number(record.amount) === 0) return 'title, valid type and date, and non-zero amount are required';
 });
 app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));

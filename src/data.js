@@ -38,6 +38,7 @@ export const navigation = [
   },
   { key: 'banking', menu: 'banking', label: 'Banking', icon: '▥', section: 'Finance', permissions: ['finance:transactions:create', 'finance:transactions:approve'] },
   { key: 'reports', menu: 'reports', label: 'Reports', icon: '◭', section: 'Insights', permissions: ['accounting:reports:view'] },
+  { key: 'governance', menu: 'governance', label: 'Enterprise governance', icon: 'EG', section: 'System', permissions: ['governance:read', 'governance:manage'] },
   { key: 'settings', menu: 'settings', label: 'Settings', icon: '⚙', section: 'System', permissions: ['settings:toggle', 'users:manage'] },
 ];
 
@@ -46,7 +47,7 @@ export const navigationSections = [
   { name: 'Operations', keys: ['inventory', 'procurement', 'manufacturing', 'hr'] },
   { name: 'Finance', keys: ['finance', 'banking'] },
   { name: 'Insights', keys: ['reports'] },
-  { name: 'System', keys: ['settings'] },
+  { name: 'System', keys: ['governance', 'settings'] },
 ];
 
 export const rangeOptions = [
