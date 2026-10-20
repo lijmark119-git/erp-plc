@@ -323,7 +323,7 @@ async function loadDemand(client, organizationId, input) {
 
 export const manufacturingService = {
   async getWorkspace(client, organizationId) {
-    const [workCenters, boms, routings, orders, supplies, latestRun, products, warehouses, receipts, lots, forecasts, maintenance] = await Promise.all([
+    const [workCenters, boms, routings, orders, supplies, latestRun, products, warehouses, receipts, lots, forecasts, maintenance, downtimeEvents] = await Promise.all([
       client.query('SELECT * FROM manufacturing_work_centers WHERE organization_id = $1 ORDER BY name', [organizationId]),
       client.query(
         `SELECT bom.*, product.sku AS finished_sku, product.name AS finished_name,
@@ -363,6 +363,15 @@ export const manufacturingService = {
          FROM manufacturing_maintenance_events event JOIN manufacturing_work_centers center ON center.id=event.work_center_id
          WHERE event.organization_id=$1 ORDER BY event.scheduled_date DESC, event.created_at DESC`, [organizationId],
       ),
+      client.query(
+        `SELECT event.*, center.code AS work_center_code, center.name AS work_center_name,
+                mo.order_number
+         FROM manufacturing_downtime_events event
+         JOIN manufacturing_work_centers center ON center.id=event.work_center_id
+         LEFT JOIN manufacturing_orders mo ON mo.id=event.manufacturing_order_id
+         WHERE event.organization_id=$1
+         ORDER BY event.downtime_date DESC, event.created_at DESC`, [organizationId],
+      ),
     ]);
     const summary = await this.getReport(client, organizationId, 'wip');
     const latestRequirements = latestRun.rows[0]
@@ -380,6 +389,7 @@ export const manufacturingService = {
       lots: lots.rows,
       forecasts: forecasts.rows,
       maintenance: maintenance.rows,
+      downtimeEvents: downtimeEvents.rows,
       latestMrp: latestRun.rows[0] ? { ...latestRun.rows[0], requirements: latestRequirements } : null,
       summary,
     };
@@ -445,6 +455,38 @@ export const manufacturingService = {
       );
       if (!result.rows[0]) throw new ManufacturingError(409, 'Only scheduled maintenance can be completed.');
       await audit(client, organizationId, actorId, 'maintenance_completed', 'maintenance_event', eventId, { downtimeMinutes: downtime });
+      return result.rows[0];
+    });
+  },
+
+  async recordDowntimeEvent(client, organizationId, actorId, input) {
+    const workCenterId = requiredText(input.workCenterId, 'workCenterId');
+    const downtimeDate = validDate(input.downtimeDate || today(), 'downtimeDate');
+    const downtimeMinutes = positive(input.downtimeMinutes, 'downtimeMinutes');
+    const reason = requiredText(input.reason, 'reason');
+    const notes = input.notes ? String(input.notes).trim() : null;
+    if (reason.length > 120) throw new ManufacturingError(400, 'reason must be 120 characters or fewer.');
+    await getWorkCenter(client, organizationId, workCenterId);
+    const orderId = input.manufacturingOrderId ? requiredText(input.manufacturingOrderId, 'manufacturingOrderId') : null;
+    if (orderId) {
+      const order = await client.query(
+        `SELECT id FROM manufacturing_orders
+         WHERE id=$1 AND organization_id=$2 AND status IN ('RELEASED','IN_PROGRESS')`,
+        [orderId, organizationId],
+      );
+      if (!order.rows[0]) throw new ManufacturingError(404, 'Active production order not found.');
+    }
+    return transaction(client, async () => {
+      const result = await client.query(
+        `INSERT INTO manufacturing_downtime_events
+           (organization_id, work_center_id, manufacturing_order_id, downtime_date,
+            downtime_minutes, reason, notes, recorded_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [organizationId, workCenterId, orderId, downtimeDate, downtimeMinutes, reason, notes, actorId],
+      );
+      await audit(client, organizationId, actorId, 'production_downtime_recorded', 'downtime_event', result.rows[0].id, {
+        workCenterId, manufacturingOrderId: orderId, downtimeDate, downtimeMinutes, reason,
+      });
       return result.rows[0];
     });
   },

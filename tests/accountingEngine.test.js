@@ -185,6 +185,44 @@ test('closed period rejects posting', async () => {
   }
 });
 
+test('closed periods can be reopened only with a reason and retain closure history', async () => {
+  const originalClosure = new Date('9998-12-31T23:59:59.000Z');
+  await client.query('BEGIN');
+  try {
+    const period = (await client.query(
+      `INSERT INTO accounting_periods (
+         organization_id, fiscal_year, period_number, period_start, period_end,
+         status, closed_at, closed_by
+       ) VALUES ($1, 9998, 12, '9998-12-01', '9999-01-01', 'CLOSED', $2, $3)
+       RETURNING id`,
+      [organizationId, originalClosure, actorId],
+    )).rows[0];
+
+    await assert.rejects(
+      () => accountingService.reopenPeriod(client, organizationId, actorId, period.id, { reason: '  ' }),
+      /reopening reason/i,
+    );
+    const reopened = await accountingService.reopenPeriod(
+      client, organizationId, actorId, period.id, { reason: 'Correct a reviewed posting date' },
+    );
+    assert.equal(reopened.status, 'OPEN');
+    assert.equal(await accountingService.reopenPeriod(
+      client, organizationId, actorId, period.id, { reason: 'Duplicate request' },
+    ), null);
+
+    const history = (await client.query(
+      `SELECT reason, previous_closed_at, previous_closed_by
+       FROM accounting_period_reopen_history WHERE period_id = $1`,
+      [period.id],
+    )).rows[0];
+    assert.equal(history.reason, 'Correct a reviewed posting date');
+    assert.equal(new Date(history.previous_closed_at).toISOString(), originalClosure.toISOString());
+    assert.equal(history.previous_closed_by, actorId);
+  } finally {
+    await client.query('ROLLBACK');
+  }
+});
+
 test('trial balance is calculated from posted entries', async () => {
   const [asset, revenue] = await createTestAccounts();
   const journal = await accountingService.createJournal(client, organizationId, actorId, {

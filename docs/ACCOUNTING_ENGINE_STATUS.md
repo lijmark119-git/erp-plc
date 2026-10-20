@@ -8,6 +8,7 @@ The accounting engine is implemented as a PostgreSQL-backed extension of the exi
 
 - Hierarchical chart of accounts with all required account types.
 - Accounting periods with open/closed controls.
+- Controlled period reopening restricted to the `accounting:periods:reopen` permission (ADMIN by default), with a required reason and retained close/reopen audit history.
 - Journal entries, journal lines, lifecycle status, approval, posting, cancellation, and reversal.
 - Balanced journal validation and atomic posting.
 - Per-account opening balance, debit, credit, and closing balance calculations.
@@ -37,6 +38,7 @@ The existing finance_transactions, bank_accounts, inventory_items, inventory_mov
 - GET /api/accounting/periods
 - POST /api/accounting/periods
 - POST /api/accounting/periods/:id/close
+- POST /api/accounting/periods/:id/reopen
 - GET /api/accounting/journals
 - POST /api/accounting/journals
 - GET /api/accounting/journals/:id
@@ -59,6 +61,7 @@ The existing finance_transactions, bank_accounts, inventory_items, inventory_mov
 - Account balances are calculated from posted journal lines and opening balances.
 - Financial reports are calculated from PostgreSQL posted transactions, never browser state.
 - Journal and period lifecycle changes are audited.
+- Reopening a closed period requires an explicit reason, stores the prior closure details, and is restricted to authorized administrators.
 
 ## Validation
 

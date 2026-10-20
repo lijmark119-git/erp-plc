@@ -183,6 +183,153 @@ test('database-backed sessions enforce permission checks through the API', async
   }
 });
 
+test('report catalog respects role permissions and saved views and exports are audited', async () => {
+  const { server, baseUrl } = await startTestServer();
+  const cookie = await login(baseUrl, sellerUsername, sellerPassword);
+  const managerCookie = await login(baseUrl, managerUsername, managerPassword);
+  const headers = { [ 'cookie' ]: cookie.split(';')[0], 'content-type': 'application/json' };
+  const viewName = `Reporting test ${Date.now()}`;
+  const auditFilter = `audit-check-${Date.now()}`;
+
+  try {
+    const catalogResponse = await fetch(`${baseUrl}/api/reports/catalog?range=30d`, { headers });
+    const catalog = await catalogResponse.json();
+    assert.equal(catalogResponse.status, 200);
+    assert.ok(catalog.reports.length > 0);
+    assert.ok(catalog.reports.every((report) => report.module === 'Sales'));
+    assert.ok(catalog.reports.every((report) => report.period.start && report.period.end && report.source));
+
+    const invalidSave = await fetch(`${baseUrl}/api/reports/saved`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: viewName, reportKey: 'raw-sql', config: { columns: ['module'] } }),
+    });
+    assert.equal(invalidSave.status, 400);
+
+    const saveResponse = await fetch(`${baseUrl}/api/reports/saved`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        name: viewName,
+        reportKey: 'dashboard-summary',
+        config: {
+          columns: ['module', 'report', 'current'],
+          filter: '',
+          pageSize: 10,
+          range: '30d',
+          sortBy: 'module',
+          sortDirection: 'asc',
+        },
+      }),
+    });
+    const saved = await saveResponse.json();
+    assert.equal(saveResponse.status, 201);
+    assert.equal(saved.name, viewName);
+
+    const otherUserSavedResponse = await fetch(`${baseUrl}/api/reports/saved`, {
+      headers: { cookie: managerCookie.split(';')[0] },
+    });
+    const otherUserSaved = await otherUserSavedResponse.json();
+    assert.equal(otherUserSavedResponse.status, 200);
+    assert.ok(otherUserSaved.every((entry) => entry.name !== viewName));
+
+    const exportResponse = await fetch(`${baseUrl}/api/reports/exports`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ reportKey: 'dashboard-summary', format: 'csv', range: '30d', filter: auditFilter }),
+    });
+    assert.equal(exportResponse.status, 201);
+
+    const userId = (await databasePool.query(
+      'SELECT id FROM users WHERE lower(username) = lower($1)',
+      [sellerUsername],
+    )).rows[0].id;
+    const audit = await databasePool.query(
+      `SELECT id FROM audit_events
+       WHERE organization_id = (SELECT organization_id FROM users WHERE id = $1)
+         AND actor_user_id = $1 AND action = 'report.exported'
+         AND details->>'filter' = $2`,
+      [userId, auditFilter],
+    );
+    assert.equal(audit.rowCount, 1);
+
+    const deleteResponse = await fetch(`${baseUrl}/api/reports/saved/${encodeURIComponent(saved.id)}`, {
+      method: 'DELETE',
+      headers,
+    });
+    assert.equal(deleteResponse.status, 200);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('ERP assistant uses authorized metrics, returns workflow help, and never executes actions', async () => {
+  const previousEnabled = process.env.ERP_AI_ENABLED;
+  process.env.ERP_AI_ENABLED = 'false';
+  const { server, baseUrl } = await startTestServer();
+  const cookie = await login(baseUrl, sellerUsername, sellerPassword);
+  const headers = { cookie: cookie.split(';')[0], 'content-type': 'application/json' };
+
+  try {
+    const response = await fetch(`${baseUrl}/api/assistant/chat`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ question: 'How do I navigate my available modules?', range: '30d' }),
+    });
+    const answer = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(answer.aiAssisted, true);
+    assert.equal(answer.providerMode, 'local_only');
+    assert.equal(answer.completedAction, false);
+    assert.deepEqual(answer.authorizedModules, ['sales']);
+    assert.match(answer.answer, /Sales/);
+    assert.ok(answer.period.start && answer.period.end);
+
+    const summaryResponse = await fetch(`${baseUrl}/api/assistant/chat`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ question: 'Summarize my sales performance', range: '30d' }),
+    });
+    const summary = await summaryResponse.json();
+    assert.equal(summaryResponse.status, 200);
+    assert.ok(summary.sourceMetrics.includes('sales'));
+    assert.ok(!summary.sourceMetrics.includes('inventory'));
+    assert.equal(summary.completedAction, false);
+
+    const invalidResponse = await fetch(`${baseUrl}/api/assistant/chat`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ question: 'x'.repeat(1501) }),
+    });
+    assert.equal(invalidResponse.status, 400);
+    const invalidRangeResponse = await fetch(`${baseUrl}/api/assistant/chat`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ question: 'Summarize my sales', range: 'unrestricted' }),
+    });
+    assert.equal(invalidRangeResponse.status, 400);
+
+    const userId = (await databasePool.query(
+      'SELECT id FROM users WHERE lower(username) = lower($1)',
+      [sellerUsername],
+    )).rows[0].id;
+    const loggedEvent = await databasePool.query(
+      `SELECT request_category, provider_mode, authorized_modules
+       FROM ai_assistant_events WHERE user_id = $1
+         AND request_category = 'workflow_help'
+       ORDER BY created_at DESC LIMIT 1`,
+      [userId],
+    );
+    assert.equal(loggedEvent.rows[0].request_category, 'workflow_help');
+    assert.equal(loggedEvent.rows[0].provider_mode, 'local_only');
+    assert.deepEqual(loggedEvent.rows[0].authorized_modules, ['sales']);
+  } finally {
+    if (previousEnabled === undefined) delete process.env.ERP_AI_ENABLED;
+    else process.env.ERP_AI_ENABLED = previousEnabled;
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 after(async () => {
   if (databasePool) await databasePool.end();
 });

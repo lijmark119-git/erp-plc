@@ -31,12 +31,15 @@ async function preserveHrWorkspace(t) {
     'SELECT fiscal_year, next_number FROM accounting_journal_sequences WHERE organization_id = $1',
     [organizationId],
   )).rows;
-  const state = { payrollPeriodId: null };
+  const state = { payrollPeriodId: null, employeeDocumentIds: [] };
 
   t.after(async () => {
     const client = await databasePool.connect();
     try {
       await client.query('BEGIN');
+      if (state.employeeDocumentIds.length) {
+        await client.query('DELETE FROM hr_employee_documents WHERE id=ANY($1::uuid[])', [state.employeeDocumentIds]);
+      }
       if (state.payrollPeriodId) {
         const sourceIds = [`payroll:${state.payrollPeriodId}`, `payroll-payment:${state.payrollPeriodId}`];
         const journals = await client.query(
@@ -126,7 +129,7 @@ function getCookieFromLogin(response) {
 }
 
 test('HR employee and attendance flows work end-to-end', async (t) => {
-  await preserveHrWorkspace(t);
+  const hrTestState = await preserveHrWorkspace(t);
   const originalData = fs.readFileSync(dataPath, 'utf8');
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
@@ -184,6 +187,32 @@ test('HR employee and attendance flows work end-to-end', async (t) => {
   }, cookie);
   assert.equal(employee.status, 201, JSON.stringify(employee.body));
   assert.equal(employee.body.employeeNumber, '20260001');
+
+  const document = await request(server, 'POST', '/api/hr/employee-documents', {
+    body: JSON.stringify({
+      employeeId: employee.body.id,
+      documentType: 'Certification',
+      documentName: 'Workplace safety certificate',
+      expiryDate: '2027-12-31',
+      referenceUrl: 'https://example.org/certificate',
+    }),
+  }, cookie);
+  assert.equal(document.status, 201, JSON.stringify(document.body));
+  hrTestState.employeeDocumentIds.push(document.body.id);
+  const documents = await request(server, 'GET', '/api/hr/employee-documents', {}, cookie);
+  assert.equal(documents.status, 200);
+  const savedDocument = documents.body.find((item) => item.id === document.body.id);
+  assert.equal(savedDocument.employee_id, employee.body.id);
+  assert.equal(savedDocument.expiry_status, 'CURRENT');
+  const invalidDocument = await request(server, 'POST', '/api/hr/employee-documents', {
+    body: JSON.stringify({
+      employeeId: employee.body.id,
+      documentType: 'Certification',
+      documentName: 'Invalid expiry',
+      expiryDate: '2026-02-30',
+    }),
+  }, cookie);
+  assert.equal(invalidDocument.status, 400);
 
   const checkIn = await request(server, 'POST', `/api/hr/attendance/check-in/${employee.body.id}`, {}, cookie);
   assert.equal(checkIn.status, 201);
@@ -326,6 +355,8 @@ test('RBAC blocks unauthorized HR and payroll access', async (t) => {
 
   const forbidden = await request(server, 'GET', '/api/hr/attendance', {}, cookie);
   assert.equal(forbidden.status, 403);
+  const documentsForbidden = await request(server, 'GET', '/api/hr/employee-documents', {}, cookie);
+  assert.equal(documentsForbidden.status, 403);
 
   const managerLogin = await request(server, 'POST', '/api/login', {
     body: JSON.stringify({ username: 'manager', password: 'manager123' }),
@@ -333,4 +364,6 @@ test('RBAC blocks unauthorized HR and payroll access', async (t) => {
   const managerCookie = getCookieFromLogin(managerLogin);
   const allowed = await request(server, 'GET', '/api/hr/attendance', {}, managerCookie);
   assert.equal(allowed.status, 200);
+  const managerDocumentsForbidden = await request(server, 'GET', '/api/hr/employee-documents', {}, managerCookie);
+  assert.equal(managerDocumentsForbidden.status, 403);
 });

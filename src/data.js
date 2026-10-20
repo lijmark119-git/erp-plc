@@ -21,6 +21,7 @@ export const navigation = [
       { key: 'suppliers', menu: 'procurement', tab: 'suppliers', label: 'Suppliers', icon: '♙', permissions: ['procurement:comparisons:read', 'procurement:suppliers:manage'] },
     ],
   },
+  { key: 'projects', menu: 'projects', label: 'Projects', icon: '▧', section: 'Operations', permissions: ['projects:read'] },
   { key: 'manufacturing', menu: 'manufacturing', label: 'Manufacturing', icon: '▦', section: 'Operations', permissions: ['manufacturing:read'] },
   {
     key: 'hr', menu: 'hr', label: 'HR', icon: '◎', section: 'Operations',
@@ -37,14 +38,14 @@ export const navigation = [
     ],
   },
   { key: 'banking', menu: 'banking', label: 'Banking', icon: '▥', section: 'Finance', permissions: ['finance:transactions:create', 'finance:transactions:approve'] },
-  { key: 'reports', menu: 'reports', label: 'Reports', icon: '◭', section: 'Insights', permissions: ['accounting:reports:view'] },
+  { key: 'reports', menu: 'reports', label: 'Reports', icon: '◭', section: 'Insights', permissions: ['accounting:reports:view', 'sales:reports:read', 'sales:orders:read', 'inventory:reports:view', 'procurement:orders:read', 'procurement:orders:create', 'procurement:orders:manage', 'finance:transactions:create', 'finance:transactions:approve', 'finance:accounts:manage'] },
   { key: 'governance', menu: 'governance', label: 'Enterprise governance', icon: 'EG', section: 'System', permissions: ['governance:read', 'governance:manage'] },
   { key: 'settings', menu: 'settings', label: 'Settings', icon: '⚙', section: 'System', permissions: ['settings:toggle', 'users:manage'] },
 ];
 
 export const navigationSections = [
   { name: 'Workspace', keys: ['dashboard', 'sales'] },
-  { name: 'Operations', keys: ['inventory', 'procurement', 'manufacturing', 'hr'] },
+  { name: 'Operations', keys: ['inventory', 'procurement', 'projects', 'manufacturing', 'hr'] },
   { name: 'Finance', keys: ['finance', 'banking'] },
   { name: 'Insights', keys: ['reports'] },
   { name: 'System', keys: ['governance', 'settings'] },

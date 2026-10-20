@@ -17,6 +17,7 @@ import {
   salesOrders,
   settings,
   workCenters,
+  navigation,
 } from './data.js';
 import {
   formatCurrency,
@@ -40,12 +41,23 @@ const authState = {
   dataLoadError: '',
 };
 const navigationState = { key: 'dashboard' };
+const assistantState = {
+  open: false,
+  loading: false,
+  error: '',
+  messages: [],
+};
 const governanceState = {
   tab: 'overview',
   loading: false,
   data: null,
   error: '',
   message: '',
+};
+const projectsState = {
+  projects: [],
+  loading: false,
+  error: '',
 };
 const legacyUiPermissions = {
   ADMIN: new Set(['finance:transactions:manage']),
@@ -79,6 +91,71 @@ function canAccessMenu(menu) {
   return Boolean(authState.user && resolveNavigationRoute(menu, authState.user.permissions || []));
 }
 
+function navigationPreferenceKey(type) {
+  return `erp-${type}-${authState.user?.id || authState.user?.username || 'unknown'}`;
+}
+
+function getNavigationPreferences(type) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(navigationPreferenceKey(type)) || '[]');
+    return Array.isArray(parsed) ? parsed.filter((key) => typeof key === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function setNavigationPreferences(type, values) {
+  try {
+    localStorage.setItem(navigationPreferenceKey(type), JSON.stringify([...new Set(values)].slice(0, 8)));
+  } catch {
+    assistantState.error = 'Browser storage is unavailable; navigation preferences were not saved.';
+  }
+}
+
+function getAuthorizedPages() {
+  const pages = [{ key: 'dashboard', label: 'Dashboard' }];
+  for (const item of navigation) {
+    if (resolveNavigationRoute(item.key, authState.user?.permissions || [])) {
+      pages.push({ key: item.key, label: item.label });
+    }
+    for (const child of item.children || []) {
+      if (resolveNavigationRoute(child.key, authState.user?.permissions || [])) {
+        pages.push({ key: child.key, label: child.label });
+      }
+    }
+  }
+  return pages;
+}
+
+function recordRecentPage(key) {
+  const recent = getNavigationPreferences('recent').filter((existing) => existing !== key);
+  setNavigationPreferences('recent', [key, ...recent]);
+}
+
+function toggleFavoritePage(key) {
+  const favorites = getNavigationPreferences('favorites');
+  setNavigationPreferences('favorites', favorites.includes(key)
+    ? favorites.filter((favorite) => favorite !== key)
+    : [key, ...favorites]);
+  render();
+}
+
+function renderQuickNavigation() {
+  const available = getAuthorizedPages();
+  const getButtons = (keys) => keys
+    .map((key) => available.find((page) => page.key === key))
+    .filter(Boolean)
+    .map((page) => `<button type="button" class="quick-nav-link" data-route-key="${escapeHtml(page.key)}">${escapeHtml(page.label)}</button>`)
+    .join('');
+  const favorites = getButtons(getNavigationPreferences('favorites'));
+  const recent = getButtons(getNavigationPreferences('recent'));
+  if (!favorites && !recent) return '';
+  return `<section class="quick-navigation" aria-label="Quick navigation">
+    ${favorites ? `<div><strong>Favorites</strong>${favorites}</div>` : ''}
+    ${recent ? `<div><strong>Recently visited</strong>${recent}</div>` : ''}
+  </section>`;
+}
+
 function activateNavigationRoute(route) {
   state.activeMenu = route.menu;
   navigationState.key = route.key;
@@ -99,6 +176,7 @@ function navigateTo(key, replace = false) {
   if (!route) return false;
 
   activateNavigationRoute(route);
+  recordRecentPage(route.key);
   const hash = `#${route.key}`;
   if (window.location.hash !== hash) {
     window.history[replace ? 'replaceState' : 'pushState'](null, '', hash);
@@ -108,6 +186,11 @@ function navigateTo(key, replace = false) {
   if (route.menu === 'governance' && !governanceState.data && !governanceState.loading) {
     loadGovernanceData().then(() => {
       if (state.activeMenu === 'governance') render();
+    });
+  }
+  if (route.menu === 'projects' && !projectsState.loading) {
+    loadProjectsData().then(() => {
+      if (state.activeMenu === 'projects') render();
     });
   }
   return true;
@@ -191,6 +274,18 @@ const dashboardState = {
   chartMetric: 'sales',
   updatedAt: null,
 };
+const reportsState = {
+  rows: [],
+  saved: [],
+  error: '',
+  filter: '',
+  range: '30d',
+  sortBy: 'module',
+  sortDirection: 'asc',
+  page: 1,
+  pageSize: 10,
+  columns: ['module', 'report', 'current', 'previous', 'change', 'count'],
+};
 const settingsUiState = {
   message: 'Settings are saved when toggled.',
   error: false,
@@ -207,6 +302,7 @@ const pageTitles = {
   inventory: ['Inventory', 'Stock control'],
   procurement: ['Procurement', 'Vendor purchasing'],
   manufacturing: ['Manufacturing', 'Production control'],
+  projects: ['Projects', 'Project and task tracking'],
   hr: ['People', 'Attendance and staffing'],
   finance: ['Finance', 'Cash flow and ledger'],
   banking: ['Banking', 'Cash management'],
@@ -244,15 +340,22 @@ const hrState = {
   leave: { types: [], balances: [], requests: [] },
   payroll: { periods: [], settings: {}, results: [], accountingEntries: [] },
   reports: { employees: [], attendance: [], leave: [], payroll: [] },
+  employeeDocuments: [],
 };
 const salesState = {
   tab: 'overview',
   orderFilter: 'ALL',
   orderSearch: '',
   customers: [],
+  customerInsights: [],
+  priceLists: [],
   quotations: [],
   orders: [],
   deliveries: [],
+  returnRequests: [],
+  performance: null,
+  performanceStart: `${new Date().toISOString().slice(0, 7)}-01`,
+  performanceEnd: new Date().toISOString().slice(0, 10),
   invoices: [],
   payments: [],
   receivables: [],
@@ -269,8 +372,10 @@ const procurementState = {
   suppliers: [],
   comparisons: [],
   orders: [],
+  warehouses: [],
   requisitions: [],
   supplierInvoices: [],
+  supplierDocuments: [],
   scorecards: [],
   loading: false,
   error: '',
@@ -321,6 +426,60 @@ async function loadGovernanceData() {
     governanceState.error = error.message;
   } finally {
     governanceState.loading = false;
+  }
+}
+
+async function loadProjectsData() {
+  if (projectsState.loading) return;
+  projectsState.loading = true;
+  projectsState.error = '';
+  try {
+    const projects = await fetchJson('/api/projects');
+    if (!Array.isArray(projects) || projects.some((project) => !Array.isArray(project.tasks))) {
+      throw new Error('The projects workspace response is invalid.');
+    }
+    projectsState.projects = projects;
+  } catch (error) {
+    projectsState.error = error.message;
+  } finally {
+    projectsState.loading = false;
+  }
+}
+
+async function handleProjectFormSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const projectId = form.dataset.projectId;
+  const payload = Object.fromEntries(new FormData(form).entries());
+  const endpoint = projectId
+    ? `/api/projects/${encodeURIComponent(projectId)}/tasks`
+    : '/api/projects';
+  try {
+    await fetchJson(endpoint, { method: 'POST', body: JSON.stringify(payload) });
+    await loadProjectsData();
+    render();
+  } catch (error) {
+    projectsState.error = error.message;
+    render();
+  }
+}
+
+async function handleProjectStatusSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const projectId = form.dataset.projectId;
+  const taskId = form.dataset.taskId;
+  const endpoint = taskId
+    ? `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(taskId)}/status`
+    : `/api/projects/${encodeURIComponent(projectId)}/status`;
+  const payload = Object.fromEntries(new FormData(form).entries());
+  try {
+    await fetchJson(endpoint, { method: 'PATCH', body: JSON.stringify(payload) });
+    await loadProjectsData();
+    render();
+  } catch (error) {
+    projectsState.error = error.message;
+    render();
   }
 }
 
@@ -376,7 +535,7 @@ async function loadApplicationData() {
     hasRolePermission('inventory:reports:view') ? fetchJson('/api/inventory') : Promise.resolve(null),
     hasRolePermission('procurement:orders:read') ? fetchJson('/api/procurement') : Promise.resolve(null),
     hasRolePermission('accounting:reports:view') ? fetchJson('/api/finance') : Promise.resolve(null),
-    canAccessMenu('reports') ? fetchJson('/api/reports') : Promise.resolve(null),
+    hasRolePermission('accounting:reports:view') ? fetchJson('/api/reports') : Promise.resolve(null),
     settingsRequest,
     accessRequest,
   ]);
@@ -399,6 +558,7 @@ async function loadApplicationData() {
   if (finance) applicationData.financeLedger = finance;
   if (reports) applicationData.reportMetrics = reports;
   await loadDashboardData();
+  if (canAccessMenu('reports')) await loadReportsData();
   if (manufacturing) {
     manufacturingState.productionOrders = manufacturing.productionOrders;
     manufacturingState.workCenters = manufacturing.workCenters;
@@ -445,6 +605,82 @@ async function loadDashboardData() {
     if (requestId === dashboardState.requestId) dashboardState.error = error.message;
   } finally {
     if (requestId === dashboardState.requestId) dashboardState.loading = false;
+  }
+}
+
+async function loadReportsData() {
+  reportsState.error = '';
+  try {
+    const [workspace, saved] = await Promise.all([
+      fetchJson(`/api/reports/catalog?range=${encodeURIComponent(reportsState.range)}`),
+      fetchJson('/api/reports/saved'),
+    ]);
+    reportsState.rows = workspace.reports || [];
+    reportsState.period = workspace.period;
+    reportsState.generatedAt = workspace.generatedAt;
+    reportsState.saved = saved || [];
+  } catch (error) {
+    reportsState.error = error.message;
+  }
+}
+
+async function saveReportConfiguration(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const name = String(new FormData(form).get('name') || '').trim();
+  try {
+    await fetchJson('/api/reports/saved', {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        reportKey: 'dashboard-summary',
+        config: {
+          columns: reportsState.columns,
+          filter: reportsState.filter,
+          pageSize: reportsState.pageSize,
+          range: reportsState.range,
+          sortBy: reportsState.sortBy,
+          sortDirection: reportsState.sortDirection,
+        },
+      }),
+    });
+    await loadReportsData();
+    render();
+  } catch (error) {
+    reportsState.error = error.message;
+    render();
+  }
+}
+
+async function applySavedReportConfiguration(event) {
+  const selected = reportsState.saved.find((saved) => saved.id === event.currentTarget.value);
+  if (!selected) return;
+  const config = selected.configuration || {};
+  reportsState.columns = Array.isArray(config.columns) ? config.columns : reportsState.columns;
+  reportsState.filter = String(config.filter || '');
+  reportsState.pageSize = Number(config.pageSize) || 10;
+  reportsState.sortBy = reportColumnLabels[config.sortBy] ? config.sortBy : 'module';
+  reportsState.sortDirection = config.sortDirection === 'desc' ? 'desc' : 'asc';
+  reportsState.range = ['7d', '30d', '90d', '1y'].includes(config.range) ? config.range : '30d';
+  reportsState.page = 1;
+  await loadReportsData();
+  render();
+}
+
+async function deleteSavedReportConfiguration() {
+  const selected = document.getElementById('report-saved-view')?.value;
+  if (!selected) {
+    reportsState.error = 'Choose a saved view to delete.';
+    render();
+    return;
+  }
+  try {
+    await fetchJson(`/api/reports/saved/${encodeURIComponent(selected)}`, { method: 'DELETE' });
+    await loadReportsData();
+    render();
+  } catch (error) {
+    reportsState.error = error.message;
+    render();
   }
 }
 
@@ -874,7 +1110,7 @@ async function loadAccountingData() {
 
 async function loadSalesData() {
   try {
-    const [customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit, crm, disputes] = await Promise.all([
+    const [customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit, crm, disputes, customerInsights, priceLists, returnRequests, performance] = await Promise.all([
       fetchJson('/api/sales/customers'),
       fetchJson('/api/sales/quotations'),
       fetchJson('/api/sales/orders'),
@@ -887,10 +1123,24 @@ async function loadSalesData() {
       fetchJson('/api/sales/audit'),
       fetchJson('/api/sales/crm'),
       hasRolePermission('sales:receivables:read') ? fetchJson('/api/sales/disputes') : Promise.resolve([]),
+      hasRolePermission('sales:customers:read') ? fetchJson('/api/sales/customer-insights') : Promise.resolve([]),
+      hasRolePermission('sales:customers:read') ? fetchJson('/api/sales/price-lists') : Promise.resolve([]),
+      hasRolePermission('sales:delivery:read') ? fetchJson('/api/sales/return-requests') : Promise.resolve([]),
+      hasRolePermission('sales:reports:read') ? fetchJson(`/api/sales/performance?startDate=${encodeURIComponent(salesState.performanceStart)}&endDate=${encodeURIComponent(salesState.performanceEnd)}`) : Promise.resolve(null),
     ]);
+    if (!Array.isArray(customerInsights) || !Array.isArray(priceLists)) {
+      throw new Error('Sales customer analytics or price-list data has an invalid response shape.');
+    }
+    if (!Array.isArray(crm.records) || !Array.isArray(crm.activities)) {
+      throw new Error('Sales CRM data has an invalid response shape.');
+    }
+    if (!Array.isArray(returnRequests) || (performance && !Array.isArray(performance.targetVsActual))) {
+      throw new Error('Sales return or performance data has an invalid response shape.');
+    }
     Object.assign(salesState, {
       customers, quotations, orders, deliveries, invoices, payments, receivables, warehouses, reports, audit,
-      crmRecords: crm.records || [], activities: crm.activities || [], disputes, error: '',
+      crmRecords: crm.records || [], activities: crm.activities || [], disputes, customerInsights, priceLists,
+      returnRequests, performance, error: '',
     });
   } catch (error) {
     salesState.error = error.message;
@@ -905,8 +1155,10 @@ async function loadProcurementData() {
       suppliers: workspace.suppliers || [],
       comparisons: workspace.comparisons || [],
       orders: workspace.orders || [],
+      warehouses: workspace.warehouses || [],
       requisitions: workspace.requisitions || [],
       supplierInvoices: workspace.supplierInvoices || [],
+      supplierDocuments: workspace.supplierDocuments || [],
       scorecards: workspace.scorecards || [],
       error: '',
     });
@@ -942,6 +1194,7 @@ async function handleProcurementControlSubmit(event) {
   const endpoints = {
     requisition: '/api/procurement/requisitions',
     supplierInvoice: '/api/procurement/supplier-invoices',
+    supplierDocument: '/api/procurement/supplier-documents',
   };
   const payload = { ...values };
   for (const field of ['quantity', 'estimatedUnitCost', 'budgetLimit', 'invoiceQuantity', 'invoiceAmount']) {
@@ -1052,7 +1305,13 @@ async function handleProcurementReceiptSubmit(event) {
   try {
     await fetchJson(`/api/procurement/orders/${encodeURIComponent(form.dataset.procurementReceive)}/receive`, {
       method: 'POST',
-      body: JSON.stringify({ quantity: Number(values.quantity), reason: values.reason }),
+      body: JSON.stringify({
+        quantity: Number(values.quantity),
+        reason: values.reason,
+        productSku: values.productSku,
+        warehouseId: values.warehouseId,
+        idempotencyKey: values.idempotencyKey,
+      }),
     });
     await loadProcurementData();
     render();
@@ -1068,13 +1327,15 @@ async function loadHrData() {
   const canReviewLeave = hasRolePermission('hr:leave:review');
   const canReadPayroll = hasRolePermission('hr:payroll:read');
   const canReadReports = hasRolePermission('hr:payroll:report');
-  const [employeesData, organization, attendance, leave, payroll, reports] = await Promise.all([
+  const canReadEmployeeDocuments = hasRolePermission('hr:employees:documents:read');
+  const [employeesData, organization, attendance, leave, payroll, reports, employeeDocuments] = await Promise.all([
     fetchJson('/api/hr/employees'),
     fetchJson('/api/hr/organization'),
     canReviewAttendance ? fetchJson('/api/hr/attendance') : Promise.resolve([]),
     canReviewLeave ? fetchJson('/api/hr/leave') : Promise.resolve({ types: [], balances: [], requests: [] }),
     canReadPayroll ? fetchJson('/api/hr/payroll') : Promise.resolve({ periods: [], settings: {}, results: [], accountingEntries: [] }),
     canReadReports ? fetchJson('/api/hr/reports') : Promise.resolve({ employees: [], attendance: [], leave: [], payroll: [] }),
+    canReadEmployeeDocuments ? fetchJson('/api/hr/employee-documents') : Promise.resolve([]),
   ]);
   hrState.workspace = organization;
   applicationData.attendanceRecords = attendance;
@@ -1088,6 +1349,7 @@ async function loadHrData() {
   hrState.leave = leave;
   hrState.payroll = payroll;
   hrState.reports = reports;
+  hrState.employeeDocuments = employeeDocuments;
   hrState.leaveCalendar = canReviewLeave
     ? await fetchJson(`/api/hr/leave/calendar?month=${encodeURIComponent(hrState.leaveMonth)}`)
     : [];
@@ -1150,6 +1412,13 @@ async function handleLoginSubmit(event) {
 
     const session = await fetchJson('/api/session');
     if (!session.user) throw new Error('Unable to load the authenticated session.');
+    if (authState.user?.id !== session.user.id) {
+      assistantState.messages = [];
+      assistantState.error = '';
+      assistantState.open = false;
+      projectsState.projects = [];
+      projectsState.error = '';
+    }
     authState.user = session.user;
     await loadApplicationData();
     syncNavigationFromHash();
@@ -1172,13 +1441,18 @@ async function handleLogout() {
     await fetchJson('/api/logout', { method: 'POST' });
   } finally {
     authState.user = null;
+    assistantState.messages = [];
+    assistantState.error = '';
+    assistantState.open = false;
+    projectsState.projects = [];
+    projectsState.error = '';
     render();
   }
 }
 
 function renderSales() {
   const tabs = [
-    ['overview', 'Overview'], ['crm', 'CRM & activity'], ['customers', 'Customers'], ['quotations', 'Quotations'],
+    ['overview', 'Overview'], ['crm', 'CRM & activity'], ['customers', 'Customers'], ['pricing', 'Customer pricing'], ['quotations', 'Quotations'],
     ['orders', 'Sales orders'], ['deliveries', 'Delivery'], ['invoices', 'Invoices'],
     ['payments', 'Payments'], ['receivables', 'Receivables'], ['reports', 'Reports'], ['creditHolds', 'Credit holds'],
   ];
@@ -1188,27 +1462,34 @@ function renderSales() {
   const orderOptions = salesState.orders.map((item) => `<option value="${item.id}">${escapeHtml(item.order_number)} · ${escapeHtml(item.customer_name)}</option>`).join('');
   const invoiceOptions = salesState.invoices.filter((item) => ['Issued', 'Overdue'].includes(item.status)).map((item) => `<option value="${item.id}">${escapeHtml(item.invoice_number)} · ${escapeHtml(item.customer_name)} · ${formatCurrency(Number(item.total))}</option>`).join('');
   const lineJson = '[{"productSku":"SKU-001","productName":"Product name","quantity":1,"unitPrice":0,"discountPercent":0,"taxPercent":0}]';
+  const priceListLineJson = '[{"productSku":"SKU-001","unitPrice":0}]';
   const form = (type, title, contents, permission) => hasRolePermission(permission)
     ? `<details class="sales-form-disclosure"><summary>${title}</summary><form class="sales-form" data-sales-form="${type}">${contents}<div class="sales-form-actions"><button class="primary-btn" type="submit">Save</button><span class="sales-form-error" role="alert"></span></div></form></details>` : '';
   const action = (id, actionName, label, permission) => hasRolePermission(permission)
     ? `<button type="button" class="small-action" data-sales-action="${actionName}" data-sales-id="${id}">${label}</button>` : '';
   const table = (headers, rows, tableClass = '') => `<div class="table-wrap"><table class="sales-table ${tableClass}"><thead><tr>${headers.map((item) => `<th>${item}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${headers.length}" class="empty-state">No records yet.</td></tr>`}</tbody></table></div>`;
+  const customerInsightById = new Map(salesState.customerInsights.map((item) => [item.customer_id, item]));
+  const priceListRows = salesState.priceLists.map((item) => `<tr><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.currency)}</td><td>${escapeHtml(String(item.effective_from).slice(0, 10))} – ${item.effective_to ? escapeHtml(String(item.effective_to).slice(0, 10)) : 'Open-ended'}</td><td>${item.active ? 'Active' : 'Inactive'}</td><td>${(item.lines || []).map((line) => `${escapeHtml(line.productSku)}: ${formatCurrency(Number(line.unitPrice))}`).join('<br>')}</td><td>${action(item.id, item.active ? 'price-list-deactivate' : 'price-list-activate', item.active ? 'Deactivate' : 'Activate', 'sales:customers:manage')}</td></tr>`).join('');
   const customerRows = salesState.customers.map((item) => {
+    const insight = customerInsightById.get(item.id) || {};
     const creditStatus = item.credit_hold
       ? `On hold${item.credit_hold_reason ? `: ${escapeHtml(item.credit_hold_reason)}` : ''}`
-      : 'Clear';
+      : insight.overdue_warning
+        ? `Overdue: ${formatCurrency(Number(insight.overdue_amount))}`
+        : 'Clear';
     const holdAction = item.credit_hold
       ? action(item.id, 'credit-release', 'Release hold', 'sales:customers:manage')
       : action(item.id, 'credit-hold', 'Place hold', 'sales:customers:manage');
-    return `<tr><td>${escapeHtml(item.customer_code)}</td><td>${escapeHtml(item.legal_name)}</td><td>${escapeHtml(item.contact_person || '')}</td><td>${escapeHtml(item.phone || '')}</td><td>${escapeHtml(item.email || '')}</td><td>${formatCurrency(Number(item.credit_limit || 0))}</td><td>${item.active ? 'Active' : 'Inactive'}</td><td>${creditStatus}</td><td>${holdAction}</td></tr>`;
+    return `<tr><td>${escapeHtml(item.customer_code)}</td><td>${escapeHtml(item.legal_name)}</td><td>${escapeHtml(item.contact_person || '')}</td><td>${escapeHtml(item.phone || '')}</td><td>${escapeHtml(item.email || '')}</td><td>${escapeHtml(insight.segment || 'PROSPECT')}</td><td>${Number(insight.purchase_count || 0)}</td><td>${formatCurrency(Number(insight.lifetime_value || 0))}</td><td>${insight.last_purchase_date ? escapeHtml(String(insight.last_purchase_date).slice(0, 10)) : '—'}</td><td>${formatCurrency(Number(insight.outstanding || 0))}</td><td>${formatCurrency(Number(item.credit_limit || 0))}</td><td>${item.active ? 'Active' : 'Inactive'}</td><td>${creditStatus}</td><td>${holdAction}</td></tr>`;
   }).join('');
-  const quotationRows = salesState.quotations.map((item) => `<tr><td>${escapeHtml(item.quotation_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.validity_date?.slice?.(0, 10) || item.validity_date)}</td><td>${renderStatus(item.status)}</td><td>${formatCurrency(Number(item.total))}</td><td>${item.status === 'Draft' ? action(item.id, 'quote-submit', 'Submit', 'sales:quotations:manage') : ''}${item.status === 'Submitted' ? action(item.id, 'quote-approve', 'Approve', 'sales:quotations:approve') + action(item.id, 'quote-reject', 'Reject', 'sales:quotations:approve') : ''}${item.status === 'Approved' ? action(item.id, 'quote-convert', 'Create order', 'sales:orders:create') : ''}</td></tr>`).join('');
+  const quotationRows = salesState.quotations.map((item) => `<tr><td>${escapeHtml(item.quotation_number)} · R${Number(item.revision_number || 1)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.validity_date?.slice?.(0, 10) || item.validity_date)}</td><td>${renderStatus(item.status)}</td><td>${formatCurrency(Number(item.total))}</td><td>${item.status === 'Draft' ? action(item.id, 'quote-submit', 'Submit', 'sales:quotations:manage') : ''}${item.status === 'Submitted' ? action(item.id, 'quote-approve', 'Approve', 'sales:quotations:approve') + action(item.id, 'quote-reject', 'Reject', 'sales:quotations:approve') : ''}${item.status === 'Approved' ? action(item.id, 'quote-convert', 'Create order', 'sales:orders:create') : ''}${item.status !== 'Converted' ? action(item.id, 'quote-revise', 'Create revision', 'sales:quotations:manage') : ''}</td></tr>`).join('');
   const orderFilters = [
     ['ALL', 'All orders'],
     ['Draft', 'Draft'],
     ['Submitted', 'Awaiting approval'],
     ['Approved', 'Approved'],
     ['Rejected', 'Rejected'],
+    ['Cancelled', 'Cancelled'],
   ];
   const normalizedOrderFilter = orderFilters.some(([value]) => value === salesState.orderFilter) ? salesState.orderFilter : 'ALL';
   const matchingOrders = salesState.orders.filter((item) => {
@@ -1219,7 +1500,15 @@ function renderSales() {
     const matchesStatus = normalizedOrderFilter === 'ALL' || status === normalizedOrderFilter;
     return matchesSearch && matchesStatus;
   });
-  const orderRows = matchingOrders.map((item) => `<tr><td><strong>${escapeHtml(item.order_number)}</strong></td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.delivery_date?.slice?.(0, 10) || item.delivery_date || '—')}</td><td>${renderStatus(item.status)}</td><td>${renderStatus(item.approval_status)}</td><td>${formatCurrency(Number(item.total))}</td><td class="sales-order-actions">${item.status === 'Draft' ? action(item.id, 'order-submit', 'Submit', 'sales:orders:create') : ''}${item.status === 'Submitted' ? action(item.id, 'order-approve', 'Approve', 'sales:orders:approve') + action(item.id, 'order-reject', 'Reject', 'sales:orders:approve') : '—'}</td></tr>`).join('');
+  const orderRows = matchingOrders.map((item) => {
+    const workflow = [
+      item.status === 'Draft' ? action(item.id, 'order-submit', 'Submit', 'sales:orders:create') : '',
+      item.status === 'Submitted' ? action(item.id, 'order-approve', 'Approve', 'sales:orders:approve') + action(item.id, 'order-reject', 'Reject', 'sales:orders:approve') : '',
+      item.status === 'Draft' ? action(item.id, 'order-amend', 'Amend', 'sales:orders:manage') : '',
+      ['Draft', 'Submitted'].includes(item.status) ? action(item.id, 'order-cancel', 'Cancel', 'sales:orders:manage') : '',
+    ].filter(Boolean).join('') || '—';
+    return `<tr><td><strong>${escapeHtml(item.order_number)}</strong></td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.delivery_date?.slice?.(0, 10) || item.delivery_date || '—')}</td><td>${renderStatus(item.status)}</td><td>${renderStatus(item.approval_status)}</td><td>${formatCurrency(Number(item.total))}</td><td class="sales-order-actions">${workflow}</td></tr>`;
+  }).join('');
   const orderEmptyState = salesState.orders.length
     ? 'No sales orders match these filters. Clear the filters to see all orders.'
     : 'No sales orders have been recorded yet. Create an order above to start the approval workflow.';
@@ -1231,8 +1520,29 @@ function renderSales() {
   }).join('');
   const legacyRows = applicationData.salesOrders.map((item) => `<tr><td>${escapeHtml(item.id)}</td><td>${escapeHtml(item.customer)}</td><td>${escapeHtml(item.date)}</td><td>${renderStatus(item.status)}</td><td>${formatCurrency(item.amount)}</td><td>${recordActions('sales', item.id, item.customer)}</td></tr>`).join('');
   const deliveryRows = salesState.deliveries.map((item) => {
-    const next = { Pending: ['Picking', 'Start picking'], Picking: ['Packed', 'Mark packed'], Packed: ['Shipped', 'Ship'], Shipped: ['Delivered', 'Confirm delivery'], Delivered: ['Returned', 'Record return'] }[item.status];
-    return `<tr><td>${escapeHtml(item.delivery_number)}</td><td>${escapeHtml(item.order_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.warehouse_id)}</td><td>${renderStatus(item.status)}</td><td>${next ? action(item.id, `delivery-${next[0].toLowerCase()}`, next[1], 'sales:delivery:manage') : ''}</td></tr>`;
+    const next = { Pending: ['Picking', 'Start picking'], Picking: ['Packed', 'Mark packed'], Packed: ['Shipped', 'Ship'], Shipped: ['Delivered', 'Confirm delivery'] }[item.status];
+    const tracking = item.tracking_url
+      ? `<a href="${escapeHtml(item.tracking_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.tracking_number || 'Track')}</a>`
+      : escapeHtml(item.tracking_number || '—');
+    const deliveryProof = item.proof_of_delivery_ref
+      ? `${escapeHtml(item.recipient_name || 'Recipient')}: ${escapeHtml(item.proof_of_delivery_ref)}`
+      : '—';
+    const deliveryActions = [
+      next ? action(item.id, `delivery-${next[0].toLowerCase()}`, next[1], 'sales:delivery:manage') : '',
+      item.status === 'Delivered' ? action(item.id, 'return-request', 'Request return', 'sales:delivery:manage') : '',
+    ].filter(Boolean).join('');
+    return `<tr><td>${escapeHtml(item.delivery_number)}</td><td>${escapeHtml(item.order_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.warehouse_id)}</td><td>${renderStatus(item.status)}</td><td>${tracking}</td><td>${deliveryProof}</td><td>${deliveryActions || '—'}</td></tr>`;
+  }).join('');
+  const returnRequestRows = salesState.returnRequests.map((item) => {
+    const inspection = item.inspected_at
+      ? `${new Date(item.inspected_at).toLocaleString()} · ${item.inspection_lines.map((line) => `${escapeHtml(line.restock_quantity)} restocked, ${escapeHtml(line.quarantine_quantity)} quarantined, ${escapeHtml(line.damaged_quantity)} damaged`).join('; ')}`
+      : 'Pending receipt inspection';
+    const actions = item.status === 'PENDING'
+      ? action(item.id, 'return-approve', 'Approve return', 'sales:delivery:manage') + action(item.id, 'return-reject', 'Reject', 'sales:delivery:manage')
+      : item.status === 'APPROVED' && !item.inspected_at
+        ? action(item.id, 'return-inspect', 'Receive & inspect', 'sales:delivery:manage')
+        : '—';
+    return `<tr><td>${escapeHtml(item.delivery_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.reason)}</td><td>${renderStatus(item.status)}</td><td>${escapeHtml(item.resolution || '—')}</td><td>${escapeHtml(inspection)}</td><td>${actions}</td></tr>`;
   }).join('');
   const invoiceRows = salesState.invoices.map((item) => `<tr><td>${escapeHtml(item.invoice_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.invoice_date?.slice?.(0, 10) || item.invoice_date)}</td><td>${escapeHtml(item.due_date?.slice?.(0, 10) || item.due_date)}</td><td>${renderStatus(item.status)}</td><td>${formatCurrency(Number(item.total))}</td><td>${item.status === 'Draft' ? action(item.id, 'invoice-issue', 'Issue & post', 'sales:invoices:manage') : ''}</td></tr>`).join('');
   const paymentRows = salesState.payments.map((item) => `<tr><td>${escapeHtml(item.receipt_number || item.payment_number)}</td><td>${escapeHtml(item.invoice_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${escapeHtml(item.payment_method)}</td><td>${escapeHtml(item.payment_date?.slice?.(0, 10) || item.payment_date)}</td><td>${formatCurrency(Number(item.amount))}</td><td>${escapeHtml(item.reference_number || '')}</td></tr>`).join('');
@@ -1241,8 +1551,21 @@ function renderSales() {
     .filter((item) => item.entity_type === 'customer' && ['customer_credit_hold_placed', 'customer_credit_hold_released'].includes(item.action))
     .map((item) => `<tr><td>${escapeHtml(item.created_at)}</td><td>${escapeHtml(item.action === 'customer_credit_hold_placed' ? 'Hold placed' : 'Hold released')}</td><td>${escapeHtml(salesState.customers.find((customer) => customer.id === item.entity_id)?.legal_name || item.entity_id)}</td><td>${escapeHtml(item.changes?.reason || '')}</td><td>${escapeHtml(item.user_id || '')}</td></tr>`).join('');
   const creditHoldCount = salesState.customers.filter((customer) => customer.credit_hold).length;
-  const crmRows = salesState.crmRecords.map((item) => `<tr><td>${escapeHtml(item.record_type)}</td><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.customer_name || item.contact_name || '—')}</td><td>${escapeHtml(item.stage)}</td><td>${formatCurrency(Number(item.estimated_value || 0))}</td><td>${item.expected_close_date ? escapeHtml(String(item.expected_close_date).slice(0, 10)) : '—'}</td></tr>`).join('');
+  const crmStages = ['NEW', 'QUALIFIED', 'PROPOSAL', 'NEGOTIATION', 'WON', 'LOST'];
+  const crmRows = salesState.crmRecords.map((item) => {
+    const stage = hasRolePermission('sales:customers:manage')
+      ? `<select aria-label="Update ${escapeHtml(item.name)} pipeline stage" data-crm-stage="${escapeHtml(item.id)}">${crmStages.map((value) => `<option value="${value}" ${value === item.stage ? 'selected' : ''}>${value}</option>`).join('')}</select>`
+      : escapeHtml(item.stage);
+    return `<tr><td>${escapeHtml(item.record_type)}</td><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.customer_name || item.contact_name || '—')}</td><td>${stage}</td><td>${formatCurrency(Number(item.estimated_value || 0))}</td><td>${item.expected_close_date ? escapeHtml(String(item.expected_close_date).slice(0, 10)) : '—'}</td></tr>`;
+  }).join('');
   const activityRows = salesState.activities.map((item) => `<tr><td>${escapeHtml(String(item.activity_date).slice(0, 16).replace('T', ' '))}</td><td>${escapeHtml(item.customer_name || item.crm_record_name || '—')}</td><td>${escapeHtml(item.activity_type)}</td><td>${escapeHtml(item.subject)}</td><td>${escapeHtml(item.details || '')}</td><td>${item.next_follow_up ? escapeHtml(String(item.next_follow_up).slice(0, 10)) : '—'}</td></tr>`).join('');
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const upcomingFollowUps = salesState.activities
+    .filter((activity) => activity.next_follow_up && String(activity.next_follow_up).slice(0, 10) <= todayKey)
+    .slice(0, 5);
+  const followUpSuggestions = upcomingFollowUps.length
+    ? `<ul>${upcomingFollowUps.map((activity) => `<li>Follow up with ${escapeHtml(activity.customer_name || activity.crm_record_name || 'the prospect')} about “${escapeHtml(activity.subject)}”.</li>`).join('')}</ul>`
+    : '<p>No follow-ups are due today. Keep the pipeline current by logging the next customer touchpoint.</p>';
   const disputeRows = salesState.disputes.map((item) => `<tr><td>${escapeHtml(item.invoice_number)}</td><td>${escapeHtml(item.customer_name)}</td><td>${formatCurrency(Number(item.outstanding))}</td><td>${escapeHtml(item.reason)}</td><td>${renderStatus(item.status)}</td><td>${escapeHtml(item.resolution || '')}</td><td>${item.status === 'OPEN' ? action(item.id, 'dispute-review', 'Review', 'sales:customers:manage') + action(item.id, 'dispute-resolve', 'Resolve', 'sales:customers:manage') : ''}</td></tr>`).join('');
   const creditHoldRows = salesState.customers.map((customer) => {
     const status = customer.credit_hold
@@ -1257,20 +1580,26 @@ function renderSales() {
     return `<tr><td>${escapeHtml(customer.customer_code)}</td><td>${escapeHtml(customer.legal_name)}</td><td>${status}</td><td>${reason}</td><td>${formatCurrency(Number(customer.credit_limit || 0))}</td><td>${holdAction}</td></tr>`;
   }).join('');
   const reports = salesState.reports || {};
+  const performance = salesState.performance || {};
+  const salespersonOptions = (performance.salespeople || [])
+    .map((person) => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.display_name)}</option>`).join('');
+  const performanceRows = (performance.targetVsActual || []).map((item) => `<tr><td>${escapeHtml(item.salesperson_name || 'Unassigned')}</td><td>${escapeHtml(String(item.target_month).slice(0, 7))}</td><td>${formatCurrency(Number(item.target_amount || 0))}</td><td>${formatCurrency(Number(item.actual_amount || 0))}</td><td>${Number(item.target_amount) > 0 ? `${(Number(item.actual_amount) / Number(item.target_amount) * 100).toFixed(1)}%` : '—'}</td></tr>`).join('');
+  const commissionRows = (performance.commissions || []).map((item) => `<tr><td>${escapeHtml(item.salesperson_name)}</td><td>${formatCurrency(Number(item.eligible_sales))}</td><td>${Number(item.rate_percent).toFixed(2)}%</td><td>${formatCurrency(Number(item.estimated_commission))}</td></tr>`).join('');
   const reportRows = (rows, firstField) => (rows || []).map((item) => `<tr><td>${escapeHtml(item[firstField] || 'Unassigned')}</td><td>${formatCurrency(Number(item.sales || 0))}</td></tr>`).join('');
   const contents = {
     overview: `<div class="sales-summary"><div><span>Customers</span><strong>${salesState.customers.length}</strong></div><div><span>Customers on credit hold</span><strong>${creditHoldCount}</strong></div><div><span>Quotations</span><strong>${salesState.quotations.length}</strong></div><div><span>Open orders</span><strong>${salesState.orders.filter((item) => !['Rejected', 'Cancelled'].includes(item.status)).length}</strong></div><div><span>Receivables</span><strong>${formatCurrency(Number(reports.receivables?.receivables || 0))}</strong></div></div><h3>Existing sales orders</h3>${table(['Order', 'Customer', 'Date', 'Status', 'Amount', 'Actions'], legacyRows)}`,
-    crm: `${form('crm', 'Add lead or opportunity', `<label>Record type<select name="recordType"><option value="LEAD">Lead</option><option value="OPPORTUNITY">Opportunity</option></select></label>${field('Name / opportunity', 'name')}${field('Contact name', 'contactName', 'text', false)}<label>Existing customer<select name="customerId"><option value="">Not linked yet</option>${customerOptions}</select></label>${field('Email', 'email', 'email', false)}${field('Phone', 'phone', 'tel', false)}${field('Source', 'source', 'text', false)}<label>Stage<select name="stage"><option value="NEW">New</option><option value="QUALIFIED">Qualified</option><option value="PROPOSAL">Proposal</option><option value="NEGOTIATION">Negotiation</option></select></label>${field('Estimated value', 'estimatedValue', 'number', false)}${field('Expected close', 'expectedCloseDate', 'date', false)}${field('Notes', 'notes', 'text', false)}`, 'sales:customers:manage')}${form('activity', 'Log customer activity', `<label>Customer<select name="customerId"><option value="">Use lead/opportunity instead</option>${customerOptions}</select></label><label>Lead / opportunity<select name="crmRecordId"><option value="">Select if no customer</option>${salesState.crmRecords.map((record) => `<option value="${record.id}">${escapeHtml(record.record_type)} · ${escapeHtml(record.name)}</option>`).join('')}</select></label><label>Activity type<select name="activityType"><option value="CALL">Call</option><option value="EMAIL">Email</option><option value="MEETING">Meeting</option><option value="NOTE">Note</option><option value="FOLLOW_UP">Follow-up</option></select></label>${field('Subject', 'subject')}${field('Details', 'details', 'text', false)}${field('Next follow-up', 'nextFollowUp', 'date', false)}`, 'sales:customers:manage')}<h3>Leads and opportunities</h3>${table(['Type','Name','Customer / contact','Stage','Estimated value','Expected close'],crmRows)}<h3>Customer activity timeline</h3>${table(['Date','Customer / lead','Type','Subject','Details','Follow-up'],activityRows)}`,
-    customers: `${form('customer', 'Add customer', `${field('Customer code', 'customerCode')}${field('Legal name', 'legalName')}${field('Contact person', 'contactPerson')}${field('Phone', 'phone', 'tel', false)}${field('Email', 'email', 'email', false)}${field('Tax ID', 'taxId', 'text', false)}${field('Credit limit', 'creditLimit', 'number', false)}${field('Payment terms', 'paymentTerms', 'text', false, 'value="30 days"')}${field('Currency', 'currency', 'text', false, 'value="ETB"')}${field('Billing address', 'billingAddress', 'text', false)}${field('Shipping address', 'shippingAddress', 'text', false)}${field('Delivery address', 'deliveryAddress', 'text', false)}`, 'sales:customers:create')}<h3>Customer register</h3>${table(['Code', 'Legal name', 'Contact', 'Phone', 'Email', 'Credit limit', 'Status', 'Credit hold', 'Actions'], customerRows)}`,
-    quotations: `${form('quotation', 'New quotation', `<label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Valid through', 'validityDate', 'date')}${field('Discount %', 'discountPercent', 'number', false)}<label>Product lines (JSON)<textarea name="lines" rows="5" required>${escapeHtml(lineJson)}</textarea></label>${field('Terms', 'terms', 'text', false)}`, 'sales:quotations:create')}<h3>Quotation pipeline</h3>${table(['Quotation', 'Customer', 'Valid through', 'Status', 'Total', 'Workflow'], quotationRows)}`,
-    orders: `${form('order', 'Create sales order', `<label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Delivery date', 'deliveryDate', 'date', false)}${field('Payment terms', 'paymentTerms', 'text', false)}${field('Discount %', 'discountPercent', 'number', false)}<label>Product lines (JSON)<textarea name="lines" rows="5" required>${escapeHtml(lineJson)}</textarea></label>`, 'sales:orders:create')}<div class="sales-order-list-header"><div><h3>Sales order register</h3><p>Approved orders remain in this list alongside drafts and orders awaiting review.</p></div><button type="button" class="secondary-btn" data-sales-orders-refresh>Refresh list</button></div><div class="sales-order-tools"><div class="sales-order-filters" role="group" aria-label="Filter sales orders by status">${orderFilterButtons}</div><form class="sales-order-search" data-sales-order-search-form><label for="sales-order-search">Search orders</label><div><input id="sales-order-search" name="search" type="search" placeholder="Order number or customer" value="${escapeHtml(salesState.orderSearch)}" /><button type="submit" class="small-action">Search</button><button type="button" class="small-action" data-sales-order-clear>Clear</button></div></form></div>${table(['Order', 'Customer', 'Delivery date', 'Status', 'Approval', 'Total', 'Workflow'], orderRows || `<tr><td colspan="7" class="empty-state">${orderEmptyState}</td></tr>`, 'sales-order-register')}`,
-    deliveries: `${form('delivery', 'Create delivery note', `<label>Approved order<select name="orderId" required>${orderOptions}</select></label><label>Warehouse<select name="warehouseId" required>${salesState.warehouses.map((item) => `<option value="${item.id}">${escapeHtml(item.code)} · ${escapeHtml(item.name)}</option>`).join('')}</select></label>${field('Delivery date', 'deliveryDate', 'date', false)}${field('Carrier', 'carrier', 'text', false)}${field('Tracking number', 'trackingNumber', 'text', false)}`, 'sales:delivery:create')}<h3>Picking, packing and shipment</h3>${table(['Delivery note', 'Order', 'Customer', 'Warehouse', 'Status', 'Next step'], deliveryRows)}`,
+    crm: `${form('crm', 'Add lead or opportunity', `<label>Record type<select name="recordType"><option value="LEAD">Lead</option><option value="OPPORTUNITY">Opportunity</option></select></label>${field('Name / opportunity', 'name')}${field('Contact name', 'contactName', 'text', false)}<label>Existing customer<select name="customerId"><option value="">Not linked yet</option>${customerOptions}</select></label>${field('Email', 'email', 'email', false)}${field('Phone', 'phone', 'tel', false)}${field('Source', 'source', 'text', false)}<label>Stage<select name="stage"><option value="NEW">New</option><option value="QUALIFIED">Qualified</option><option value="PROPOSAL">Proposal</option><option value="NEGOTIATION">Negotiation</option></select></label>${field('Estimated value', 'estimatedValue', 'number', false)}${field('Expected close', 'expectedCloseDate', 'date', false)}${field('Notes', 'notes', 'text', false)}`, 'sales:customers:manage')}${form('activity', 'Log customer activity', `<label>Customer<select name="customerId"><option value="">Use lead/opportunity instead</option>${customerOptions}</select></label><label>Lead / opportunity<select name="crmRecordId"><option value="">Select if no customer</option>${salesState.crmRecords.map((record) => `<option value="${record.id}">${escapeHtml(record.record_type)} · ${escapeHtml(record.name)}</option>`).join('')}</select></label><label>Activity type<select name="activityType"><option value="CALL">Call</option><option value="EMAIL">Email</option><option value="MEETING">Meeting</option><option value="NOTE">Note</option><option value="FOLLOW_UP">Follow-up</option></select></label>${field('Subject', 'subject')}${field('Details', 'details', 'text', false)}${field('Next follow-up', 'nextFollowUp', 'date', false)}`, 'sales:customers:manage')}<h3>Leads and opportunities</h3>${table(['Type','Name','Customer / contact','Stage','Estimated value','Expected close'],crmRows)}<section class="sales-follow-up-suggestions"><p class="eyebrow">Rule-based follow-up suggestions from your activity log</p>${followUpSuggestions}</section><h3>Customer activity timeline</h3>${table(['Date','Customer / lead','Type','Subject','Details','Follow-up'],activityRows)}`,
+    customers: `${form('customer', 'Add customer', `${field('Customer code', 'customerCode')}${field('Legal name', 'legalName')}${field('Contact person', 'contactPerson')}${field('Phone', 'phone', 'tel', false)}${field('Email', 'email', 'email', false)}${field('Tax ID', 'taxId', 'text', false)}${field('Credit limit', 'creditLimit', 'number', false)}${field('Payment terms', 'paymentTerms', 'text', false, 'value="30 days"')}${field('Currency', 'currency', 'text', false, 'value="ETB"')}${field('Billing address', 'billingAddress', 'text', false)}${field('Shipping address', 'shippingAddress', 'text', false)}${field('Delivery address', 'deliveryAddress', 'text', false)}`, 'sales:customers:create')}<p class="subtle">Customer segmentation, purchase count, lifetime billed value, last purchase, and overdue balances use posted invoice and receivable data.</p><h3>Customer register and profiles</h3>${table(['Code', 'Legal name', 'Contact', 'Phone', 'Email', 'Segment', 'Purchases', 'Lifetime value', 'Last purchase', 'Outstanding', 'Credit limit', 'Status', 'Credit status', 'Actions'], customerRows)}`,
+    pricing: `${form('price-list', 'Create customer price list', `<label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Price list name', 'name')}${field('Currency', 'currency', 'text', false, 'value="ETB"')}${field('Effective from', 'effectiveFrom', 'date', false)}${field('Effective to', 'effectiveTo', 'date', false)}<label>Product prices (JSON)<textarea name="lines" rows="5" required>${escapeHtml(priceListLineJson)}</textarea></label>`, 'sales:customers:manage')}<p class="subtle">Seller-entered unit prices must match the active customer price list or the product catalogue. Price overrides are limited to users with sales order or quotation management permission.</p><h3>Customer price lists</h3>${table(['Customer', 'Price list', 'Currency', 'Effective', 'Status', 'Product prices', 'Actions'], priceListRows)}`,
+    quotations: `${form('quotation', 'New quotation', `<label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Valid through', 'validityDate', 'date')}${field('Discount %', 'discountPercent', 'number', false)}<label>Product lines (JSON)<textarea name="lines" rows="5" required>${escapeHtml(lineJson)}</textarea></label>${field('Terms', 'terms', 'text', false)}`, 'sales:quotations:create')}<h3>Quotation pipeline</h3>${table(['Quotation / revision', 'Customer', 'Valid through', 'Status', 'Total', 'Workflow'], quotationRows)}`,
+    orders: `${form('order', 'Create sales order', `<input type="hidden" name="idempotencyKey" value="${crypto.randomUUID()}" /><label>Customer<select name="customerId" required>${customerOptions}</select></label>${field('Delivery date', 'deliveryDate', 'date', false)}${field('Payment terms', 'paymentTerms', 'text', false)}${field('Discount %', 'discountPercent', 'number', false)}<label>Product lines (JSON)<textarea name="lines" rows="5" required>${escapeHtml(lineJson)}</textarea></label>`, 'sales:orders:create')}<div class="sales-order-list-header"><div><h3>Sales order register</h3><p>Approved orders remain in this list alongside drafts and orders awaiting review. Duplicate submit retries with the same request key return the original order.</p></div><button type="button" class="secondary-btn" data-sales-orders-refresh>Refresh list</button></div><div class="sales-order-tools"><div class="sales-order-filters" role="group" aria-label="Filter sales orders by status">${orderFilterButtons}</div><form class="sales-order-search" data-sales-order-search-form><label for="sales-order-search">Search orders</label><div><input id="sales-order-search" name="search" type="search" placeholder="Order number or customer" value="${escapeHtml(salesState.orderSearch)}" /><button type="submit" class="small-action">Search</button><button type="button" class="small-action" data-sales-order-clear>Clear</button></div></form></div>${table(['Order', 'Customer', 'Delivery date', 'Status', 'Approval', 'Total', 'Workflow'], orderRows || `<tr><td colspan="7" class="empty-state">${orderEmptyState}</td></tr>`, 'sales-order-register')}`,
+    deliveries: `${form('delivery', 'Create delivery note', `<label>Approved order<select name="orderId" required>${orderOptions}</select></label><label>Warehouse<select name="warehouseId" required>${salesState.warehouses.map((item) => `<option value="${item.id}">${escapeHtml(item.code)} · ${escapeHtml(item.name)}</option>`).join('')}</select></label>${field('Delivery date', 'deliveryDate', 'date', false)}${field('Carrier', 'carrier', 'text', false)}${field('Tracking number', 'trackingNumber', 'text', false)}`, 'sales:delivery:create')}<h3>Picking, packing and shipment</h3>${table(['Delivery note', 'Order', 'Customer', 'Warehouse', 'Status', 'Tracking', 'Proof of delivery', 'Actions'], deliveryRows)}<p class="subtle">Return authorization does not change stock. Approved returns must be physically received and inspected before restockable goods enter available inventory; quarantined and damaged goods remain unavailable.</p><h3>Return requests</h3>${table(['Delivery', 'Customer', 'Reason', 'Status', 'Resolution', 'Inspection', 'Actions'], returnRequestRows)}`,
     invoices: `${form('invoice', 'Create customer invoice', `<label>Approved order<select name="orderId" required>${orderOptions}</select></label>${field('Invoice date', 'invoiceDate', 'date', false)}${field('Due date', 'dueDate', 'date')}`, 'sales:invoices:create')}<h3>Customer invoices</h3>${table(['Invoice', 'Customer', 'Invoice date', 'Due date', 'Status', 'Total', 'Posting'], invoiceRows)}`,
     payments: `${form('payment', 'Record customer payment', `<label>Issued invoice<select name="invoiceId" required>${invoiceOptions}</select></label><label>Method<select name="paymentMethod" required><option value="cash">Cash</option><option value="bank">Bank</option><option value="transfer">Transfer</option><option value="cheque">Cheque</option><option value="other">Other</option></select></label>${field('Amount', 'amount', 'number')}${field('Payment date', 'paymentDate', 'date', false)}${field('Reference / cheque number', 'referenceNumber', 'text', false)}`, 'sales:payments:create')}<h3>Receipts</h3>${table(['Receipt', 'Invoice', 'Customer', 'Method', 'Date', 'Amount', 'Reference'], paymentRows)}`,
     receivables: `<h3>Accounts receivable aging</h3>${table(['Invoice', 'Customer', 'Due date', 'Invoice total', 'Paid', 'Outstanding', 'Aging', 'Status'], receivableRows)}${form('dispute', 'Open receivable dispute', `<label>Open receivable<select name="receivableId" required>${salesState.receivables.filter((item) => Number(item.outstanding) > 0).map((item) => `<option value="${item.id}">${escapeHtml(item.invoice_number)} · ${escapeHtml(item.customer_name)} · ${formatCurrency(Number(item.outstanding))}</option>`).join('')}</select></label>${field('Reason', 'reason')}`, 'sales:customers:manage')}<h3>Dispute management</h3>${table(['Invoice','Customer','Outstanding','Reason','Status','Resolution','Action'],disputeRows)}`,
     creditHolds: `<p>Orders are blocked when a customer is on hold or the order would exceed the approved credit limit.</p><h3>Customer credit status</h3>${table(['Code', 'Customer', 'Credit status', 'Reason', 'Approved limit', 'Actions'], creditHoldRows)}<h3>Credit hold history</h3>${table(['Date', 'Action', 'Customer', 'Reason', 'Authorized by'], creditHistoryRows)}`,
     creditHistory: `<h3>Customer credit hold history</h3>${table(['Date', 'Action', 'Customer', 'Reason', 'Authorized by'], creditHistoryRows)}`,
-    reports: `<div class="sales-summary"><div><span>Gross sales</span><strong>${formatCurrency(Number(reports.summary?.gross_sales || 0))}</strong></div><div><span>Discounts</span><strong>${formatCurrency(Number(reports.summary?.discounts || 0))}</strong></div><div><span>VAT</span><strong>${formatCurrency(Number(reports.summary?.vat || 0))}</strong></div><div><span>Net sales</span><strong>${formatCurrency(Number(reports.summary?.net_sales || 0))}</strong></div></div><div class="sales-report-grid"><section><h3>By customer</h3>${table(['Customer', 'Sales'], reportRows(reports.byCustomer, 'legal_name'))}</section><section><h3>By product</h3>${table(['Product', 'Sales'], reportRows(reports.byProduct, 'product_name'))}</section><section><h3>By salesperson</h3>${table(['Salesperson', 'Sales'], reportRows(reports.bySalesperson, 'salesperson'))}</section><section><h3>By period</h3>${table(['Period', 'Sales'], reportRows(reports.byPeriod, 'period'))}</section></div>`,
+    reports: `<div class="sales-summary"><div><span>Gross sales</span><strong>${formatCurrency(Number(reports.summary?.gross_sales || 0))}</strong></div><div><span>Discounts</span><strong>${formatCurrency(Number(reports.summary?.discounts || 0))}</strong></div><div><span>VAT</span><strong>${formatCurrency(Number(reports.summary?.vat || 0))}</strong></div><div><span>Net sales</span><strong>${formatCurrency(Number(reports.summary?.net_sales || 0))}</strong></div><div><span>Next-month statistical estimate</span><strong>${formatCurrency(Number(performance.forecast?.nextMonthNetSales || 0))}</strong></div></div><div class="sales-report-grid"><section><h3>By customer</h3>${table(['Customer', 'Sales'], reportRows(reports.byCustomer, 'legal_name'))}</section><section><h3>By product</h3>${table(['Product', 'Sales'], reportRows(reports.byProduct, 'product_name'))}</section><section><h3>By salesperson</h3>${table(['Salesperson', 'Sales'], reportRows(reports.bySalesperson, 'salesperson'))}</section><section><h3>By period</h3>${table(['Period', 'Sales'], reportRows(reports.byPeriod, 'period'))}</section></div><form class="sales-performance-range" data-sales-performance-range><label>From<input name="startDate" type="date" value="${escapeHtml(salesState.performanceStart)}" required /></label><label>Through<input name="endDate" type="date" value="${escapeHtml(salesState.performanceEnd)}" required /></label><button class="small-action" type="submit">Update performance period</button></form><h3>Target versus actual</h3>${table(['Salesperson', 'Month', 'Target', 'Actual net sales', 'Attainment'], performanceRows)}${form('commission-rule', 'Add commission rule', `<label>Salesperson<select name="salespersonId" required>${salespersonOptions}</select></label>${field('Commission rate %', 'ratePercent', 'number')}${field('Effective from', 'effectiveFrom', 'date', false)}${field('Effective through', 'effectiveTo', 'date', false)}`, 'sales:customers:manage')}${form('sales-target', 'Set monthly sales target', `<label>Salesperson<select name="salespersonId" required>${salespersonOptions}</select></label>${field('Target month', 'targetMonth', 'month')}${field('Target amount', 'targetAmount', 'number')}`, 'sales:customers:manage')}<h3>Estimated commissions</h3><p class="subtle">Estimate uses posted net invoice sales and effective commission rules. It is a report, not a payroll or accounting posting.</p>${table(['Salesperson', 'Eligible net sales', 'Rate', 'Estimated commission'], commissionRows)}`,
   };
   return `<section class="content-panel sales-workspace"><div class="panel-header"><div><p class="eyebrow">Sales process</p><h2>Customer to cash</h2></div></div>${salesState.error ? `<p class="sales-error" role="alert">${escapeHtml(salesState.error)}</p>` : ''}<nav class="sales-tabs" aria-label="Sales sections">${tabs.map(([key, label]) => `<button type="button" data-sales-tab="${key}" class="${active === key ? 'active' : ''}">${label}</button>`).join('')}</nav><div class="sales-content">${contents[active]}</div></section>`;
 }
@@ -1669,6 +1998,8 @@ function renderProcurement() {
   </details>` : '';
   const supplierContent = `<div class="procurement-section-heading"><div><h3>Supplier directory</h3><p>Maintain the suppliers used across purchasing comparisons.</p></div><span class="procurement-count">${procurementState.suppliers.length} active</span></div>
     ${supplierForm}
+    ${canManageSuppliers ? `<details class="procurement-disclosure"><summary>+ Register supplier certification or document</summary><form class="procurement-form-grid" data-procurement-control="supplierDocument"><label>Supplier<select name="supplierId" required>${procurementState.suppliers.map((supplier) => `<option value="${supplier.id}">${escapeHtml(supplier.name)}</option>`).join('')}</select></label><label>Document type<input name="documentType" required maxlength="80" placeholder="Business license / certification" /></label><label>Document name<input name="documentName" required maxlength="180" /></label><label>Expiry date<input name="expiryDate" type="date" /></label><label>Document URL<input name="referenceUrl" type="url" placeholder="https://" /></label><button class="primary-btn" type="submit" ${procurementState.suppliers.length ? '' : 'disabled'}>Save document</button><span class="procurement-form-error" role="alert"></span></form></details>` : ''}
+    ${procurementState.supplierDocuments.length ? `<h3>Supplier document expiry reminders</h3><div class="table-wrap"><table><thead><tr><th>Supplier</th><th>Document</th><th>Type</th><th>Expiry</th><th>Status</th><th>Reference</th></tr></thead><tbody>${procurementState.supplierDocuments.map((document) => `<tr><td>${escapeHtml(document.supplier_name)}</td><td>${escapeHtml(document.document_name)}</td><td>${escapeHtml(document.document_type)}</td><td>${escapeHtml(document.expiry_date ? String(document.expiry_date).slice(0, 10) : 'No expiry recorded')}</td><td>${escapeHtml(document.expiry_status.replaceAll('_', ' '))}</td><td>${document.reference_url ? `<a href="${escapeHtml(document.reference_url)}" target="_blank" rel="noopener noreferrer">Open document</a>` : '—'}</td></tr>`).join('')}</tbody></table></div>` : ''}
     <div class="procurement-supplier-grid">${procurementState.suppliers.length ? procurementState.suppliers.map((supplier) => `<article class="procurement-supplier-card">
       <div class="procurement-supplier-avatar">${escapeHtml(String(supplier.name).slice(0, 1).toUpperCase())}</div><div class="procurement-supplier-info"><strong>${escapeHtml(supplier.name)}</strong><span>${escapeHtml(supplier.supplier_code)} · ${escapeHtml(supplier.qualification_status || 'PENDING')} · ${escapeHtml(supplier.risk_level || 'MEDIUM')} risk</span></div>
       <div class="procurement-supplier-meta">${supplier.contact_name ? `<span>${escapeHtml(supplier.contact_name)}</span>` : ''}${supplier.email ? `<a href="mailto:${escapeHtml(supplier.email)}">${escapeHtml(supplier.email)}</a>` : ''}${supplier.phone ? `<span>${escapeHtml(supplier.phone)}</span>` : ''}<span>${escapeHtml(supplier.payment_terms || 'Payment terms set per quotation')}</span></div>
@@ -1711,7 +2042,7 @@ function renderProcurement() {
       ? `<button class="small-action" type="button" data-procurement-action="approve" data-id="${order.id}">Approve</button><button class="small-action danger-btn" type="button" data-procurement-action="reject" data-id="${order.id}">Reject</button>`
       : '';
     const receiveForm = ['APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED'].includes(order.status) && hasRolePermission('procurement:orders:receive')
-      ? `<form class="procurement-receive-form" data-procurement-receive="${order.id}"><label>Receive qty<input name="quantity" type="number" min="0.001" max="${remaining}" step="0.001" required /></label><label>Receipt note<input name="reason" required placeholder="Packing slip / condition" /></label><button class="small-action" type="submit">Record receipt</button><span class="procurement-form-error" role="alert"></span></form>`
+      ? `<form class="procurement-receive-form" data-procurement-receive="${order.id}"><input type="hidden" name="idempotencyKey" value="${crypto.randomUUID()}" /><label>Receive qty<input name="quantity" type="number" min="0.001" max="${remaining}" step="0.001" required /></label><label>Inventory SKU<input name="productSku" value="${escapeHtml(order.inventory_product_sku || order.comparison_sku || '')}" placeholder="For stocked goods" /></label><label>Receiving warehouse<select name="warehouseId"><option value="">No stock item / select warehouse</option>${procurementState.warehouses.map((warehouse) => `<option value="${warehouse.id}" ${warehouse.id === order.inventory_warehouse_id ? 'selected' : ''}>${escapeHtml(warehouse.code)} · ${escapeHtml(warehouse.name)}</option>`).join('')}</select></label><label>Receipt note<input name="reason" required placeholder="Packing slip / condition" /></label><button class="small-action" type="submit">Record receipt</button><span class="procurement-form-error" role="alert"></span></form>`
       : '';
     const history = order.history || [];
     return `<tr><td><strong>${escapeHtml(order.po_number)}</strong><span class="procurement-table-sub">${escapeHtml(order.comparison_title)}</span></td><td>${escapeHtml(order.supplier_name)}</td><td>${escapeHtml(order.expected_delivery_date ? String(order.expected_delivery_date).slice(0, 10) : '—')}</td><td>${showStatus(order.status)}</td><td>${Number(order.received_quantity)} / ${Number(order.ordered_quantity)}</td><td><strong>${formatCurrency(total)}</strong><span class="procurement-table-sub">${escapeHtml(order.payment_terms)}</span></td><td>${decisionActions}${receiveForm}<details class="procurement-history"><summary>History (${history.length})</summary>${history.map((item) => `<p><strong>${escapeHtml(item.action.replaceAll('_', ' '))}</strong> · ${escapeHtml(item.actor_name || 'System')}<br /><span>${escapeHtml(new Date(item.occurred_at).toLocaleString())}${item.reason ? ` · ${escapeHtml(item.reason)}` : ''}</span></p>`).join('')}</details></td></tr>`;
@@ -1742,6 +2073,7 @@ function renderHR() {
   const tabs = [
     ['employees', 'Employees'],
     ['organization', 'Organization'],
+    ...(hasRolePermission('hr:employees:documents:read') ? [['documents', 'Documents']] : []),
     ...(hasRolePermission('hr:attendance:review') ? [['attendance', 'Attendance']] : []),
     ...(hasRolePermission('hr:leave:review') ? [['leave', 'Leave']] : []),
     ...(hasRolePermission('hr:payroll:read') ? [['payroll', 'Payroll']] : []),
@@ -1752,6 +2084,7 @@ function renderHR() {
   const renderTab = {
     employees: renderHrEmployees,
     organization: renderHrOrganization,
+    documents: renderHrEmployeeDocuments,
     attendance: renderHrAttendance,
     leave: renderHrLeave,
     payroll: renderHrPayroll,
@@ -1844,6 +2177,23 @@ function renderHrEmployees() {
     <div class="hr-form-actions"><button class="primary-btn" type="submit">Save employee</button><span class="hr-form-error" role="alert"></span></div>
   </form></details>` : '';
   return `<div class="hr-section-heading"><div><h3>Employee register</h3><p>${applicationData.employees.length} employee records</p></div><button class="secondary-btn" type="button" data-hr-export="employees">Export CSV</button></div>${form}${hrTable(['Number', 'Employee', 'Department', 'Position', 'Type', 'Hire date', 'Salary', 'Status', 'Actions'], rows)}`;
+}
+
+function renderHrEmployeeDocuments() {
+  const employees = applicationData.employees;
+  const form = hasRolePermission('hr:employees:documents:manage') ? `<details class="hr-form-disclosure" open><summary>Register employee document</summary><form class="hr-form" data-hr-form="employee-document">
+    <label>Employee<select name="employeeId" required>${employees.map((employee) => `<option value="${escapeHtml(employee.id)}">${escapeHtml(hrEmployeeName(employee))} · ${escapeHtml(employee.employeeNumber)}</option>`).join('')}</select></label>
+    ${hrFormField('Document type', 'documentType', 'text')}
+    ${hrFormField('Document name', 'documentName', 'text')}
+    ${hrFormField('Expiry date', 'expiryDate', 'date', null, false)}
+    ${hrFormField('Document reference URL', 'referenceUrl', 'url', null, false)}
+    <div class="hr-form-actions"><button class="primary-btn" type="submit" ${employees.length ? '' : 'disabled'}>Save document details</button><span class="hr-form-error" role="alert"></span></div>
+  </form></details>` : '';
+  const rows = hrState.employeeDocuments.map((document) => {
+    const employee = employees.find((item) => item.id === document.employee_id);
+    return `<tr><td>${escapeHtml(employee ? hrEmployeeName(employee) : 'Employee record unavailable')}</td><td>${escapeHtml(document.document_type)}</td><td>${escapeHtml(document.document_name)}</td><td>${escapeHtml(document.expiry_date ? String(document.expiry_date).slice(0, 10) : 'No expiry recorded')}</td><td>${escapeHtml(document.expiry_status.replaceAll('_', ' '))}</td><td>${document.reference_url ? `<a href="${escapeHtml(document.reference_url)}" target="_blank" rel="noopener noreferrer">Open reference</a>` : '—'}</td></tr>`;
+  }).join('');
+  return `<div class="hr-section-heading"><div><h3>Employee documents</h3><p>Restricted document metadata and expiry alerts</p></div></div>${form}<h3>Expiry status</h3>${hrTable(['Employee', 'Type', 'Document', 'Expiry date', 'Status', 'Reference'], rows, 'No employee document records.')}`;
 }
 
 function renderHrOrganization() {
@@ -2118,6 +2468,7 @@ function renderAccountingWorkspace() {
   const canCreateJournal = hasRolePermission('accounting:journals:create');
   const canManageAccounts = hasRolePermission('accounting:accounts:manage');
   const canManagePeriods = hasRolePermission('accounting:periods:manage');
+  const canReopenPeriods = hasRolePermission('accounting:periods:reopen');
   const canManageBudgets = hasRolePermission('accounting:budgets:manage');
   const table = (headers, rows) => `<div class="table-wrap"><table class="accounting-table"><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${headers.length}" class="empty-state">No records available.</td></tr>`}</tbody></table></div>`;
   const action = (journal, key, label, permission) => hasRolePermission(permission)
@@ -2167,7 +2518,7 @@ function renderAccountingWorkspace() {
     ledger: `<div class="accounting-ledger-header"><label>Account<select id="accounting-ledger-account">${accounts.map((account) => `<option value="${account.id}" ${account.id === selectedAccountId ? 'selected' : ''}>${escapeHtml(account.account_code)} · ${escapeHtml(account.account_name)}</option>`).join('')}</select></label><div><span>Opening</span><strong>${formatCurrency(Number(accountingState.ledger?.openingBalance || 0))}</strong></div><div><span>Closing</span><strong>${formatCurrency(Number(accountingState.ledger?.closingBalance || 0))}</strong></div></div>${table(['Date','Journal','Reference','Description','Debit','Credit','Running balance'], ledgerRows)}`,
     accounts: `${forms}<h3>Chart of accounts</h3>${table(['Code','Account','Type','Normal balance','Status','Closing balance','Action'], accountRows)}`,
     journals: `${forms}<h3>Journal entries</h3>${table(['Number','Date','Description','Source','Status','Workflow'], journalRows)}`,
-    periods: `${forms}<div class="accounting-section-heading"><h3>Accounting periods</h3>${canManagePeriods ? `<form class="accounting-year-close" data-accounting-form="year-close"><label>Fiscal year<input name="fiscalYear" type="number" value="${year}" required /></label><label>Retained earnings code<input name="retainedEarningsCode" value="3100" required /></label><button class="danger-btn" type="submit">Close fiscal year</button><span class="accounting-error" role="alert"></span></form>` : ''}</div>${table(['Fiscal year','Period','Start','End','Status','Action'], periods.map((period) => `<tr><td>${period.fiscal_year}</td><td>${period.period_number}</td><td>${String(period.period_start).slice(0,10)}</td><td>${String(period.period_end).slice(0,10)}</td><td>${renderStatus(period.status)}</td><td>${period.status === 'OPEN' && canManagePeriods ? `<button class="small-action" data-accounting-close-period="${period.id}">Close period</button>` : ''}</td></tr>`).join(''))}`,
+    periods: `${forms}<div class="accounting-section-heading"><h3>Accounting periods</h3>${canManagePeriods ? `<form class="accounting-year-close" data-accounting-form="year-close"><label>Fiscal year<input name="fiscalYear" type="number" value="${year}" required /></label><label>Retained earnings code<input name="retainedEarningsCode" value="3100" required /></label><button class="danger-btn" type="submit">Close fiscal year</button><span class="accounting-error" role="alert"></span></form>` : ''}</div>${table(['Fiscal year','Period','Start','End','Status','Action'], periods.map((period) => `<tr><td>${period.fiscal_year}</td><td>${period.period_number}</td><td>${String(period.period_start).slice(0,10)}</td><td>${String(period.period_end).slice(0,10)}</td><td>${renderStatus(period.status)}</td><td>${period.status === 'OPEN' && canManagePeriods ? `<button class="small-action" data-accounting-close-period="${period.id}">Close period</button>` : period.status === 'CLOSED' && canReopenPeriods ? `<button class="small-action" data-accounting-reopen-period="${period.id}">Reopen period</button>` : ''}</td></tr>`).join(''))}`,
     reports: `<div class="accounting-report-summary"><article><span>Revenue</span><strong>${formatCurrency(Number(report.profitAndLoss?.revenue || 0))}</strong></article><article><span>Expenses</span><strong>${formatCurrency(Number(report.profitAndLoss?.expenses || 0))}</strong></article><article><span>Net income</span><strong>${formatCurrency(Number(report.profitAndLoss?.netIncome || 0))}</strong></article><article><span>Cash movement</span><strong>${formatCurrency(Number(report.cashFlow?.netCashFlow || 0))}</strong></article><article><span>Assets</span><strong>${formatCurrency(Number(report.balanceSheet?.assets || 0))}</strong></article><article><span>Liabilities + equity</span><strong>${formatCurrency(Number(report.balanceSheet?.totalLiabilitiesAndEquity || 0))}</strong></article></div><h3>Trial balance</h3>${table(['Code','Account','Type','Debits','Credits','Balance'], reportRows)}`,
     budgets: `${forms}<h3>Monthly budget versus posted actuals</h3><p>Actuals include posted general-ledger journals only and are matched by account, month, cost center, and profit center. Positive variance means budget is above actual.</p>${table(['Budget','Year','Month','Account','Cost center','Profit center','Budget','Actual','Variance'], budgetRows)}`,
   };
@@ -2422,6 +2773,7 @@ function renderManufacturing() {
   const qualityRows = (manufacturingState.qualityInspections || []).map((inspection) => `<tr><td>${escapeHtml(inspection.lot_number)}</td><td>${escapeHtml(inspection.sku)} · ${escapeHtml(inspection.product_name)}</td><td>${escapeHtml(inspection.order_number || inspection.lot_type)}</td><td>${escapeHtml(inspection.inspection_stage)}</td><td>${Number(inspection.inspected_quantity)}</td><td>${Number(inspection.passed_quantity)}</td><td>${Number(inspection.failed_quantity)}</td><td>${renderStatus(inspection.result)}</td><td>${escapeHtml(inspection.defect_code || '')}</td><td>${escapeHtml(inspection.inspector_username || '')}</td><td>${escapeHtml(String(inspection.inspected_at).slice(0, 16).replace('T', ' '))}</td></tr>`).join('');
   const forecastRows = (workspace.forecasts || []).map((item) => `<tr><td>${escapeHtml(item.sku)} · ${escapeHtml(item.product_name)}</td><td>${escapeHtml(String(item.forecast_date).slice(0, 10))}</td><td>${Number(item.quantity)}</td><td>${escapeHtml(item.notes || '')}</td></tr>`).join('');
   const maintenanceRows = (workspace.maintenance || []).map((item) => `<tr><td>${escapeHtml(item.work_center_code)} · ${escapeHtml(item.work_center_name)}</td><td>${escapeHtml(item.maintenance_type)}</td><td>${escapeHtml(item.description)}</td><td>${escapeHtml(String(item.scheduled_date).slice(0, 10))}</td><td>${item.next_due_date ? escapeHtml(String(item.next_due_date).slice(0, 10)) : '—'}</td><td>${Number(item.downtime_minutes)} min</td><td>${renderStatus(item.status)}</td><td>${item.status === 'PLANNED' && hasRolePermission('manufacturing:routing:manage') ? `<button class="small-action" data-manufacturing-action="maintenance-complete" data-id="${item.id}">Complete</button>` : ''}</td></tr>`).join('');
+  const downtimeRows = (workspace.downtimeEvents || []).map((event) => `<tr><td>${escapeHtml(String(event.downtime_date).slice(0, 10))}</td><td>${escapeHtml(event.work_center_code)} · ${escapeHtml(event.work_center_name)}</td><td>${escapeHtml(event.order_number || 'Not linked')}</td><td>${Number(event.downtime_minutes)} min</td><td>${escapeHtml(event.reason)}</td><td>${escapeHtml(event.notes || '')}</td></tr>`).join('');
   const createOrderFields = `<label>Finished product<select name="finishedProductId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Active BOM<select name="bomId" required>${bomOptions}</select></label><label>Routing<select name="routingId"><option value="">No routing</option>${routingOptions}</select></label><label>Warehouse<select name="warehouseId" required>${warehouses.map((warehouse) => `<option value="${warehouse.id}">${escapeHtml(warehouse.code)} · ${escapeHtml(warehouse.name)}</option>`).join('')}</select></label><label>Planned quantity<input name="plannedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Planned start<input name="plannedStart" type="date" /></label><label>Due date<input name="dueDate" type="date" /></label>`;
   const selectedOrder = manufacturingState.selectedOrder;
   const orderDetail = selectedOrder ? `<section class="manufacturing-detail"><div class="manufacturing-detail-header"><div><p class="eyebrow">${escapeHtml(selectedOrder.order_number)}</p><h3>${escapeHtml(selectedOrder.finished_name)} · ${renderStatus(selectedOrder.status)}</h3></div><button class="small-action" data-manufacturing-refresh-order="${selectedOrder.id}">Refresh detail</button></div><h4>Material plan and actual consumption</h4>${table(['Material','Required','Reserved','Consumed','Unit','Material cost'],selectedOrder.materials.map((material) => `<tr><td>${escapeHtml(material.sku)} · ${escapeHtml(material.name)}</td><td>${Number(material.required_quantity)}</td><td>${Number(material.reserved_quantity)}</td><td>${Number(material.consumed_quantity)}</td><td>${escapeHtml(material.uom_code)}</td><td>${formatCurrency(Number(material.consumed_quantity)*Number(material.unit_cost))}</td></tr>`).join(''))}<h4>Routing execution</h4>${table(['Seq','Operation','Work center','Status','Planned machine/labor h','Actual machine/labor h','Action'],selectedOrder.operations.map((operation) => `<tr><td>${operation.sequence_number}</td><td>${escapeHtml(operation.operation_name)}</td><td>${escapeHtml(operation.work_center_name)}</td><td>${renderStatus(operation.status)}</td><td>${Number(operation.planned_machine_hours).toFixed(2)} / ${Number(operation.planned_labor_hours).toFixed(2)}</td><td>${Number(operation.actual_machine_hours).toFixed(2)} / ${Number(operation.actual_labor_hours).toFixed(2)}</td><td>${operation.status === 'PLANNED' && selectedOrder.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:orders:release') ? `<button class="small-action" data-manufacturing-action="start-operation" data-order="${selectedOrder.id}" data-id="${operation.id}">Start</button>` : ''}${operation.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:output:record') ? `<form class="manufacturing-inline-operation" data-manufacturing-form="complete-operation" data-order="${selectedOrder.id}" data-operation="${operation.id}"><label>Machine h<input name="actualMachineHours" type="number" min="0" step="0.01" value="${Number(operation.planned_machine_hours)}" required /></label><label>Labor h<input name="actualLaborHours" type="number" min="0" step="0.01" value="${Number(operation.planned_labor_hours)}" required /></label><button class="small-action" type="submit">Complete</button><span class="manufacturing-form-error" role="alert"></span></form>` : ''}</td></tr>`).join(''))}<h4>Production batches</h4>${table(['Batch','Production date','Good quantity','Rejected','Unit cost'],selectedOrder.outputs.map((output) => `<tr><td>${escapeHtml(output.lot_number)}</td><td>${String(output.production_date).slice(0,10)}</td><td>${Number(output.produced_quantity)}</td><td>${Number(output.rejected_quantity)}</td><td>${formatCurrency(Number(output.unit_cost))}</td></tr>`).join(''))}${selectedOrder.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:materials:consume') ? `<form class="manufacturing-data-form compact-manufacturing-form" data-manufacturing-form="consume" data-order="${selectedOrder.id}"><h4>Consume reserved material</h4><label>Material<select name="productId">${selectedOrder.materials.map((material) => `<option value="${material.raw_material_product_id}">${escapeHtml(material.sku)} · ${escapeHtml(material.name)}</option>`).join('')}</select></label><label>Quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label><label>Raw lot number<input name="lotNumber" required /></label><button class="primary-btn" type="submit">Record consumption</button><span class="manufacturing-form-error" role="alert"></span></form>` : ''}${selectedOrder.status === 'IN_PROGRESS' && hasRolePermission('manufacturing:output:record') ? `<form class="manufacturing-data-form compact-manufacturing-form" data-manufacturing-form="output" data-order="${selectedOrder.id}"><h4>Record finished output</h4><label>Good quantity<input name="producedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Rejected quantity<input name="rejectedQuantity" type="number" min="0" step="0.001" value="0" /></label><label>Batch number<input name="batchNumber" /></label><label>Production date<input name="productionDate" type="date" value="${today()}" required /></label><button class="primary-btn" type="submit">Post finished output</button><span class="manufacturing-form-error" role="alert"></span></form>` : ''}</section>` : '';
@@ -2435,7 +2787,7 @@ function renderManufacturing() {
     routing: `${form('work-center','Create work center',`<label>Code<input name="code" required /></label><label>Name<input name="name" required /></label><label>Machine<input name="machineName" /></label><label>Machine capacity<input name="machineCapacity" type="number" min="0.001" step="0.1" value="1" required /></label><label>Labor capacity<input name="laborCapacity" type="number" min="0.001" step="0.1" value="1" required /></label><label>Machine hourly cost<input name="machineHourRate" type="number" min="0" step="0.01" value="0" /></label><label>Labor hourly cost<input name="laborHourRate" type="number" min="0" step="0.01" value="0" /></label><label>Overhead hourly cost<input name="overheadHourRate" type="number" min="0" step="0.01" value="0" /></label><label class="manufacturing-wide">Calendar JSON<textarea name="calendar" rows="3">{"workingDays":[1,2,3,4,5],"hoursPerDay":8}</textarea></label>`,'manufacturing:routing:manage')}${form('routing','Create routing version',`<label>Finished product<select name="finishedProductId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Routing code<input name="routingCode" required /></label><label>Version<input name="version" required /></label><label>Effective from<input name="effectiveFrom" type="date" value="${today()}" required /></label><label class="manufacturing-wide">Operations JSON<textarea name="operations" rows="5" required>${escapeHtml(JSON.stringify(operationSample,null,2))}</textarea></label>`,'manufacturing:routing:manage')}<h3>Work centers</h3>${table(['Code','Center','Machine','Machine capacity','Labor capacity','Machine cost/h','Labor cost/h','Overhead/h','Status'],centerRows)}<h3>Routings</h3>${table(['Code','Version','Finished product','Operations','Effective','Active'],routingRows)}`,
     orders: `${form('order','Plan manufacturing order',createOrderFields,'manufacturing:orders:create')}<h3>Production orders</h3>${table(['Order','Finished product','Planned','Output','Warehouse','Due','Status','Action'],orderRows)}${orderDetail}`,
     quality: `${form('quality','Record lot inspection',`<label>Lot<select name="lotId" required>${lotOptions}</select></label><label>Inspection stage<select name="inspectionStage"><option value="INCOMING">Incoming</option><option value="IN_PROCESS">In process</option><option value="FINAL">Final</option></select></label><label>Inspected quantity<input name="inspectedQuantity" type="number" min="0.000001" step="0.000001" required /></label><label>Passed quantity<input name="passedQuantity" type="number" min="0" step="0.000001" value="0" required /></label><label>Failed quantity<input name="failedQuantity" type="number" min="0" step="0.000001" value="0" required /></label><label>Defect code<input name="defectCode" maxlength="80" /></label><label class="manufacturing-wide">Notes<textarea name="notes" rows="2"></textarea></label>`,'manufacturing:quality:manage')}<h3>Inspection history</h3>${table(['Lot','Product','Order / lot type','Stage','Inspected','Passed','Failed','Result','Defect','Inspector','Inspected at'],qualityRows)}`,
-    planning: `${form('forecast','Add demand forecast',`<label>Product<select name="productId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Forecast date<input name="forecastDate" type="date" value="${today()}" required /></label><label>Forecast quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label><label>Notes<input name="notes" maxlength="500" /></label>`,'manufacturing:mrp:run')}<h3>Demand forecast</h3>${table(['Product','Date','Quantity','Notes'],forecastRows)}${form('maintenance','Schedule equipment maintenance',`<label>Work center<select name="workCenterId" required>${(workspace.workCenters || []).filter((center)=>center.active).map((center)=>`<option value="${center.id}">${escapeHtml(center.code)} · ${escapeHtml(center.name)}</option>`).join('')}</select></label><label>Type<select name="maintenanceType"><option value="PREVENTIVE">Preventive</option><option value="CORRECTIVE">Corrective / downtime</option></select></label><label>Description<input name="description" maxlength="240" required /></label><label>Scheduled date<input name="scheduledDate" type="date" value="${today()}" required /></label><label>Next due date<input name="nextDueDate" type="date" /></label><label class="manufacturing-wide">Notes<textarea name="notes" rows="2"></textarea></label>`,'manufacturing:routing:manage')}<h3>Maintenance schedule and downtime</h3>${table(['Work center','Type','Description','Scheduled','Next due','Downtime','Status','Action'],maintenanceRows)}`,
+    planning: `${form('forecast','Add demand forecast',`<label>Product<select name="productId" required>${productOptions(['FINISHED_GOOD','SEMI_FINISHED_GOOD'])}</select></label><label>Forecast date<input name="forecastDate" type="date" value="${today()}" required /></label><label>Forecast quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label><label>Notes<input name="notes" maxlength="500" /></label>`,'manufacturing:mrp:run')}<h3>Demand forecast</h3>${table(['Product','Date','Quantity','Notes'],forecastRows)}${form('maintenance','Schedule equipment maintenance',`<label>Work center<select name="workCenterId" required>${(workspace.workCenters || []).filter((center)=>center.active).map((center)=>`<option value="${center.id}">${escapeHtml(center.code)} · ${escapeHtml(center.name)}</option>`).join('')}</select></label><label>Type<select name="maintenanceType"><option value="PREVENTIVE">Preventive</option><option value="CORRECTIVE">Corrective / downtime</option></select></label><label>Description<input name="description" maxlength="240" required /></label><label>Scheduled date<input name="scheduledDate" type="date" value="${today()}" required /></label><label>Next due date<input name="nextDueDate" type="date" /></label><label class="manufacturing-wide">Notes<textarea name="notes" rows="2"></textarea></label>`,'manufacturing:routing:manage')}<h3>Maintenance schedule and downtime</h3>${table(['Work center','Type','Description','Scheduled','Next due','Downtime','Status','Action'],maintenanceRows)}${form('downtime','+ Record unplanned production stoppage',`<label>Work center<select name="workCenterId" required>${(workspace.workCenters || []).filter((center)=>center.active).map((center)=>`<option value="${center.id}">${escapeHtml(center.code)} · ${escapeHtml(center.name)}</option>`).join('')}</select></label><label>Production order<select name="manufacturingOrderId"><option value="">Not linked to an order</option>${(workspace.orders || []).filter((order)=>['RELEASED','IN_PROGRESS'].includes(order.status)).map((order)=>`<option value="${order.id}">${escapeHtml(order.order_number)} · ${escapeHtml(order.finished_sku)}</option>`).join('')}</select></label><label>Date<input name="downtimeDate" type="date" value="${today()}" required /></label><label>Downtime minutes<input name="downtimeMinutes" type="number" min="0.01" step="0.01" required /></label><label>Stop reason<input name="reason" maxlength="120" required placeholder="Breakdown, material shortage, quality hold…" /></label><label class="manufacturing-wide">Notes<textarea name="notes" rows="2"></textarea></label>`,'manufacturing:orders:release')}<h3>Unplanned production stoppages</h3>${table(['Date','Work center','Production order','Downtime','Reason','Notes'],downtimeRows)}`,
     mrp: `${form('mrp','Run MRP',`<label>Demand source<select name="demandSource"><option value="SALES_ORDERS">Approved sales orders</option><option value="FORECAST">Demand forecast</option><option value="COMBINED">Sales orders + forecast</option></select></label><label>Planning date<input name="planningDate" type="date" value="${today()}" required /></label><label>Demand horizon end<input name="endDate" type="date" /></label><label class="manufacturing-wide">Override demand JSON (optional)<textarea name="demands" rows="3" placeholder='[{"productId":"...","quantity":100}]'></textarea></label>`,'manufacturing:mrp:run')}${form('purchase-supply','Register open purchase supply',`<label>PO number<input name="purchaseOrderNumber" required /></label><label>Material<select name="productId" required>${productOptions(['RAW_MATERIAL','SEMI_FINISHED_GOOD'])}</select></label><label>Ordered quantity<input name="orderedQuantity" type="number" min="0.000001" step="0.001" required /></label><label>Due date<input name="dueDate" type="date" /></label>`,'manufacturing:mrp:run')}${form('raw-lot','Register raw material lot',`<label>Receipt transaction<select name="inventoryTransactionId" required>${workspace.inventoryReceipts.map((receipt) => { const product=products.find((item)=>item.id===receipt.product_id); return `<option value="${receipt.id}">${escapeHtml(product?.sku || receipt.product_id)} · ${Number(receipt.quantity)} · ${escapeHtml(String(receipt.transaction_date).slice(0,10))}</option>`; }).join('')}</select></label><label>Lot number<input name="lotNumber" required /></label><label>Lot quantity<input name="quantity" type="number" min="0.000001" step="0.001" required /></label>`,'manufacturing:materials:consume')}<div class="manufacturing-mrp-results"><div class="manufacturing-section-heading"><h3>Latest material requirements</h3>${hasRolePermission('manufacturing:reports:read') ? '<button type="button" class="secondary-btn" data-manufacturing-action="mrp-refresh">Refresh</button>' : ''}</div>${mrp ? table(['Material','Gross required','Safety','On hand','Reserved','Open purchase','Open production','Net requirement','Suggested'],mrp.requirements.map((item)=>`<tr><td>${escapeHtml(item.sku)} · ${escapeHtml(item.product_name)}</td><td>${Number(item.gross_required)}</td><td>${Number(item.safety_stock)}</td><td>${Number(item.on_hand)}</td><td>${Number(item.reserved)}</td><td>${Number(item.open_purchase)}</td><td>${Number(item.open_production)}</td><td>${Number(item.net_requirement)}</td><td>${Number(item.suggested_quantity)}</td></tr>`).join('')) : '<p>No MRP run yet.</p>'}</div><h3>Open purchase supply</h3>${table(['Purchase order','Material','Ordered','Received','Due','Status'],workspace.openPurchaseSupply.map((item)=>`<tr><td>${escapeHtml(item.purchase_order_number)}</td><td>${escapeHtml(products.find((product)=>product.id===item.product_id)?.sku || item.product_id)}</td><td>${Number(item.ordered_quantity)}</td><td>${Number(item.received_quantity)}</td><td>${item.due_date ? String(item.due_date).slice(0,10) : '—'}</td><td>${escapeHtml(item.status)}</td></tr>`).join(''))}`,
     reports: `<label class="manufacturing-report-select">Report<select id="manufacturing-report-type">${[['production-plan','Production plan'],['orders','Production orders'],['consumption','Material consumption'],['variance','Production variance'],['wip','WIP'],['production-cost','Production cost'],['machine-utilization','Machine utilization'],['yield','Yield and scrap'],['scrap','Scrap']].map(([value,label])=>`<option value="${value}" ${manufacturingState.reportType===value?'selected':''}>${label}</option>`).join('')}</select></label><div class="manufacturing-section-heading"><h3>${escapeHtml(manufacturingState.reportType)}</h3><button type="button" class="secondary-btn" data-manufacturing-action="load-report">Refresh</button></div>${reportTable}<h3>Batch traceability</h3><form class="manufacturing-data-form compact-manufacturing-form" data-manufacturing-form="trace"><label>Batch / lot number<input name="lotNumber" required /></label><button class="primary-btn" type="submit">Trace lot</button><span class="manufacturing-form-error" role="alert"></span></form>${manufacturingState.trace ? `<pre class="manufacturing-trace">${escapeHtml(JSON.stringify(manufacturingState.trace,null,2))}</pre>` : ''}`,
   };
@@ -2585,7 +2937,11 @@ async function handleManufacturingDataForm(event) {
       payload.quantity = Number(values.quantity);
     } else if (type === 'maintenance') {
       endpoint = '/api/manufacturing/maintenance';
-    } else if (type === 'purchase-supply') {
+      } else if (type === 'downtime') {
+        endpoint = '/api/manufacturing/downtime';
+        payload.downtimeMinutes = Number(values.downtimeMinutes);
+        payload.manufacturingOrderId = values.manufacturingOrderId || null;
+      } else if (type === 'purchase-supply') {
       endpoint = '/api/manufacturing/mrp/open-supply';
       payload.orderedQuantity = Number(values.orderedQuantity);
     } else if (type === 'raw-lot') {
@@ -2836,6 +3192,27 @@ async function closeAccountingPeriodInUi(periodId) {
   }
 }
 
+async function reopenAccountingPeriodInUi(periodId) {
+  const reason = window.prompt('Enter the reason for reopening this accounting period (required):');
+  if (reason === null) return;
+  if (!reason.trim()) {
+    accountingState.error = 'A reopening reason is required.';
+    render();
+    return;
+  }
+  try {
+    await fetchJson(`/api/accounting/periods/${encodeURIComponent(periodId)}/reopen`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason.trim() }),
+    });
+    await loadAccountingData();
+    render();
+  } catch (error) {
+    accountingState.error = error.message;
+    render();
+  }
+}
+
 async function handleSalesFormSubmit(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -2853,6 +3230,9 @@ async function handleSalesFormSubmit(event) {
     crm: ['/api/sales/crm', 'POST'],
     activity: ['/api/sales/activities', 'POST'],
     dispute: ['/api/sales/disputes', 'POST'],
+    'price-list': ['/api/sales/price-lists', 'POST'],
+    'commission-rule': ['/api/sales/commission-rules', 'POST'],
+    'sales-target': ['/api/sales/targets', 'POST'],
   };
   const route = routes[type];
   if (!route) return;
@@ -2866,13 +3246,18 @@ async function handleSalesFormSubmit(event) {
     delete payload.shippingAddress;
     delete payload.deliveryAddress;
   }
-  if (['quotation', 'order'].includes(type)) {
+  if (['quotation', 'order', 'price-list'].includes(type)) {
     try { payload.lines = JSON.parse(values.lines); }
     catch { if (error) error.textContent = 'Product lines must be valid JSON.'; return; }
-    payload.discountPercent = Number(values.discountPercent || 0);
+    if (['quotation', 'order'].includes(type)) payload.discountPercent = Number(values.discountPercent || 0);
     delete payload.linesText;
   }
   if (type === 'payment') payload.amount = Number(values.amount);
+  if (type === 'commission-rule') payload.ratePercent = Number(values.ratePercent);
+  if (type === 'sales-target') {
+    payload.targetAmount = Number(values.targetAmount);
+    payload.targetMonth = `${values.targetMonth}-01`;
+  }
   try {
     await fetchJson(route[0], { method: route[1], body: JSON.stringify(payload) });
     await loadSalesData();
@@ -2885,6 +3270,32 @@ async function handleSalesFormSubmit(event) {
 async function handleSalesAction(recordId, action) {
   let url = '';
   let body = {};
+  if (action === 'order-amend') {
+    const order = salesState.orders.find((item) => item.id === recordId);
+    if (!order) {
+      window.alert('The selected sales order is no longer available.');
+      return;
+    }
+    const reason = window.prompt('Reason for amending this draft sales order:');
+    if (!reason?.trim()) return;
+    const currentDeliveryDate = String(order.delivery_date || '').slice(0, 10);
+    const deliveryDate = window.prompt('Revised delivery date (YYYY-MM-DD), or leave blank to clear it:', currentDeliveryDate);
+    if (deliveryDate === null) return;
+    const paymentTerms = window.prompt('Payment terms:', order.payment_terms || '');
+    if (paymentTerms === null) return;
+    url = `/api/sales/orders/${encodeURIComponent(recordId)}/amend`;
+    body = { reason: reason.trim(), deliveryDate: deliveryDate.trim() || null, paymentTerms: paymentTerms.trim() };
+  }
+  if (action === 'order-cancel') {
+    const reason = window.prompt('Reason for cancelling this draft or submitted sales order:');
+    if (!reason?.trim()) return;
+    url = `/api/sales/orders/${encodeURIComponent(recordId)}/cancel`;
+    body.reason = reason.trim();
+  }
+  if (action === 'price-list-activate' || action === 'price-list-deactivate') {
+    url = `/api/sales/price-lists/${encodeURIComponent(recordId)}/status`;
+    body.active = action === 'price-list-activate';
+  }
   if (action === 'credit-hold' || action === 'credit-release') {
     const reason = window.prompt(action === 'credit-hold' ? 'Reason for placing the customer on credit hold:' : 'Reason for releasing the customer credit hold:');
     if (!reason?.trim()) return;
@@ -2892,6 +3303,7 @@ async function handleSalesAction(recordId, action) {
     body.reason = reason.trim();
   }
   if (action === 'quote-submit') url = `/api/sales/quotations/${encodeURIComponent(recordId)}/submit`;
+  if (action === 'quote-revise') url = `/api/sales/quotations/${encodeURIComponent(recordId)}/revise`;
   if (action === 'quote-approve' || action === 'quote-reject') {
     url = `/api/sales/quotations/${encodeURIComponent(recordId)}/decision`;
     body.status = action === 'quote-approve' ? 'Approved' : 'Rejected';
@@ -2904,6 +3316,58 @@ async function handleSalesAction(recordId, action) {
   if (action.startsWith('delivery-')) {
     url = `/api/sales/deliveries/${encodeURIComponent(recordId)}/status`;
     body.status = action.slice('delivery-'.length).replace(/^[a-z]/, (character) => character.toUpperCase());
+    if (body.status === 'Delivered') {
+      const recipientName = window.prompt('Name of the person receiving this delivery (optional):');
+      if (recipientName === null) return;
+      const proofOfDeliveryRef = window.prompt('Proof-of-delivery reference (optional):');
+      if (proofOfDeliveryRef === null) return;
+      body.recipientName = recipientName.trim();
+      body.proofOfDeliveryRef = proofOfDeliveryRef.trim();
+    }
+    if (body.status === 'Shipped') {
+      const trackingUrl = window.prompt('Shipment tracking URL (optional):');
+      if (trackingUrl === null) return;
+      body.trackingUrl = trackingUrl.trim();
+    }
+  }
+  if (action === 'return-request') {
+    const reason = window.prompt('Reason for requesting return of this delivery:');
+    if (!reason?.trim()) return;
+    url = `/api/sales/deliveries/${encodeURIComponent(recordId)}/return-requests`;
+    body.reason = reason.trim();
+  }
+  if (action === 'return-approve' || action === 'return-reject') {
+    const resolution = window.prompt(action === 'return-approve' ? 'Approval note for this return:' : 'Reason for rejecting this return:');
+    if (!resolution?.trim()) return;
+    url = `/api/sales/return-requests/${encodeURIComponent(recordId)}/decision`;
+    body = { decision: action === 'return-approve' ? 'APPROVED' : 'REJECTED', resolution: resolution.trim() };
+  }
+  if (action === 'return-inspect') {
+    const request = salesState.returnRequests.find((item) => item.id === recordId);
+    if (!request) return;
+    const defaultLines = request.delivery_lines.map((line) => ({
+      deliveryLineId: line.deliveryLineId,
+      receivedQuantity: Number(line.deliveredQuantity),
+      restockQuantity: Number(line.deliveredQuantity),
+      quarantineQuantity: 0,
+      damagedQuantity: 0,
+    }));
+    const linesInput = window.prompt(
+      'Enter the inspected quantities as JSON. For each line, receivedQuantity must equal restockQuantity + quarantineQuantity + damagedQuantity.',
+      JSON.stringify(defaultLines),
+    );
+    if (linesInput === null) return;
+    let lines;
+    try {
+      lines = JSON.parse(linesInput);
+    } catch {
+      window.alert('Inspection quantities must be valid JSON.');
+      return;
+    }
+    const notes = window.prompt('Inspection notes (optional):');
+    if (notes === null) return;
+    url = `/api/sales/return-requests/${encodeURIComponent(recordId)}/inspection`;
+    body = { lines, notes };
   }
   if (action === 'invoice-issue') url = `/api/sales/invoices/${encodeURIComponent(recordId)}/issue`;
   if (action === 'dispute-review' || action === 'dispute-resolve') {
@@ -2917,7 +3381,7 @@ async function handleSalesAction(recordId, action) {
   }
   if (!url) return;
   try {
-    await fetchJson(url, { method: 'POST', body: JSON.stringify(body) });
+    await fetchJson(url, { method: action.startsWith('price-list-') ? 'PUT' : 'POST', body: JSON.stringify(body) });
     await loadSalesData();
     render();
   } catch (error) {
@@ -3075,30 +3539,128 @@ async function handleBankApproval(button) {
 }
 
 function exportReport() {
-  const rows = [
-    ['Metric', 'Value', 'Progress'],
-    ...applicationData.reportMetrics.map((metric) => [metric.label, metric.value, `${metric.progress}%`]),
-  ];
-  const csv = rows.map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = 'plc-management-report.csv';
-  link.click();
-  URL.revokeObjectURL(url);
+  void exportLiveReport();
+}
+
+const reportColumnLabels = Object.freeze({
+  module: 'Module',
+  report: 'Report',
+  current: 'Current period',
+  previous: 'Previous period',
+  change: 'Change',
+  count: 'Transactions',
+});
+
+function getFilteredReportRows() {
+  const query = reportsState.filter.trim().toLowerCase();
+  return reportsState.rows
+    .filter((row) => !query || `${row.module} ${row.label} ${row.source}`.toLowerCase().includes(query))
+    .sort((left, right) => {
+      const a = left[reportsState.sortBy === 'report' ? 'label' : reportsState.sortBy];
+      const b = right[reportsState.sortBy === 'report' ? 'label' : reportsState.sortBy];
+      const comparison = typeof a === 'number' && typeof b === 'number'
+        ? a - b
+        : String(a ?? '').localeCompare(String(b ?? ''));
+      return reportsState.sortDirection === 'asc' ? comparison : -comparison;
+    });
+}
+
+function formatReportValue(value, row) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value !== 'number') return escapeHtml(value);
+  return new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency: row.currency || 'ETB',
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+async function exportLiveReport() {
+  const rows = getFilteredReportRows();
+  if (!rows.length) {
+    reportsState.error = 'There are no report rows to export with the current filter.';
+    render();
+    return;
+  }
+  try {
+    await fetchJson('/api/reports/exports', {
+      method: 'POST',
+      body: JSON.stringify({
+        reportKey: 'dashboard-summary',
+        format: 'csv',
+        range: reportsState.range,
+        filter: reportsState.filter,
+      }),
+    });
+    const columns = reportsState.columns;
+    const csvCell = (value) => {
+      let text = String(value ?? '');
+      if (/^[\s]*[=+\-@]/.test(text)) text = `'${text}`;
+      return `"${text.replaceAll('"', '""')}"`;
+    };
+    const values = (row, key) => {
+      if (key === 'module') return row.module;
+      if (key === 'report') return row.label;
+      if (key === 'current') return row.current;
+      if (key === 'previous') return row.previous ?? '';
+      if (key === 'change') return row.change ?? '';
+      if (key === 'count') return row.count ?? '';
+      return '';
+    };
+    const csv = [
+      ['Report', 'Dashboard summary'],
+      ['Reporting period', reportsState.period ? `${reportsState.period.start} to ${reportsState.period.end}` : reportsState.range],
+      ['Filter', reportsState.filter || 'None'],
+      ['Generated at', reportsState.generatedAt || new Date().toISOString()],
+      [],
+      columns.map((column) => reportColumnLabels[column]),
+      ...rows.map((row) => columns.map((column) => values(row, column))),
+    ].map((line) => line.map(csvCell).join(',')).join('\r\n');
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `plc-reports-${reportsState.range}.csv`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    reportsState.error = '';
+  } catch (error) {
+    reportsState.error = error.message;
+    render();
+  }
 }
 
 function renderReports() {
+  const rows = getFilteredReportRows();
+  const pageCount = Math.max(1, Math.ceil(rows.length / reportsState.pageSize));
+  reportsState.page = Math.min(reportsState.page, pageCount);
+  const pageRows = rows.slice((reportsState.page - 1) * reportsState.pageSize, reportsState.page * reportsState.pageSize);
+  const tableColumns = reportsState.columns;
+  const heading = (key) => `<th><button type="button" class="report-sort" data-report-sort="${key}">${reportColumnLabels[key]}${reportsState.sortBy === key ? (reportsState.sortDirection === 'asc' ? ' ↑' : ' ↓') : ''}</button></th>`;
+  const tableRows = pageRows.map((row) => `<tr>
+    ${tableColumns.map((column) => {
+      if (column === 'module') return `<td>${escapeHtml(row.module)}</td>`;
+      if (column === 'report') return `<td><span>${escapeHtml(row.label)}</span><small class="report-source">Source: ${escapeHtml(row.source)}</small></td>`;
+      if (column === 'count') return `<td>${row.count == null ? '—' : Number(row.count).toLocaleString()}</td>`;
+      return `<td>${formatReportValue(row[column], row)}</td>`;
+    }).join('')}
+    <td><button type="button" class="small-action" data-report-drilldown="${escapeHtml(row.module.toLowerCase())}">Open module</button></td>
+  </tr>`).join('');
+  const currentPeriod = reportsState.period
+    ? `${reportsState.period.start} to ${reportsState.period.end}`
+    : 'Loading report period';
   return `
     <section class="content-panel">
       <div class="panel-header">
         <div>
-          <p class="eyebrow">Performance</p>
+          <p class="eyebrow">Performance · live data</p>
           <h2>Management reports</h2>
         </div>
         <button class="primary-btn" id="export-report">Export report</button>
       </div>
+      <p class="subtle">Date range: ${escapeHtml(currentPeriod)} · Period-based metrics compare with the preceding equal-length period. Cash, receivables, payables, and inventory values are point-in-time balances.</p>
+      ${reportsState.error ? `<p class="accounting-error" role="alert">${escapeHtml(reportsState.error)}</p>` : ''}
+      <h3>Existing snapshot KPIs (preserved)</h3>
       <div class="grid two-column">
         ${applicationData.reportMetrics
           .map(
@@ -3116,6 +3678,27 @@ function renderReports() {
           )
           .join('')}
       </div>
+      <section class="report-catalog" aria-labelledby="report-catalog-title">
+        <div class="panel-header">
+          <div><p class="eyebrow">Authorized report catalog</p><h3 id="report-catalog-title">Operational and financial summary</h3></div>
+          <label>Period<select id="report-period">
+            ${rangeOptions.map((option) => `<option value="${option.value}" ${reportsState.range === option.value ? 'selected' : ''}>${option.label}</option>`).join('')}
+          </select></label>
+        </div>
+        <div class="report-toolbar">
+          <form data-report-filter-form><label>Filter reports<input name="filter" value="${escapeHtml(reportsState.filter)}" maxlength="120" placeholder="Search module, report, or source" /></label><button class="secondary-btn" type="submit">Apply</button></form>
+          <label>Rows per page<select id="report-page-size">${[5, 10, 25, 50, 100].map((size) => `<option value="${size}" ${reportsState.pageSize === size ? 'selected' : ''}>${size}</option>`).join('')}</select></label>
+          <details class="report-column-picker"><summary>Columns</summary>${Object.entries(reportColumnLabels).map(([key, label]) => `<label><input type="checkbox" data-report-column="${key}" ${tableColumns.includes(key) ? 'checked' : ''} />${label}</label>`).join('')}</details>
+        </div>
+        <div class="report-saved-controls">
+          <form data-report-save-form><label>Save current view<input name="name" maxlength="80" required placeholder="Monthly management summary" /></label><button class="secondary-btn" type="submit">Save view</button></form>
+          <label>Saved views<select id="report-saved-view"><option value="">Choose a saved view</option>${reportsState.saved.map((saved) => `<option value="${saved.id}">${escapeHtml(saved.name)}</option>`).join('')}</select></label>
+          <button class="small-action" type="button" data-report-delete-saved ${reportsState.saved.length ? '' : 'disabled'}>Delete selected view</button>
+        </div>
+        <div class="table-wrap"><table class="accounting-table"><thead><tr>${tableColumns.map(heading).join('')}<th>Drill-down</th></tr></thead><tbody>${tableRows || `<tr><td colspan="${tableColumns.length + 1}" class="empty-state">No authorized live report rows match this filter.</td></tr>`}</tbody></table></div>
+        <div class="report-pagination"><span>${rows.length ? `Showing ${(reportsState.page - 1) * reportsState.pageSize + 1}–${Math.min(reportsState.page * reportsState.pageSize, rows.length)} of ${rows.length}` : 'No rows'}</span><div><button class="small-action" type="button" data-report-page="-1" ${reportsState.page <= 1 ? 'disabled' : ''}>Previous</button><span>Page ${reportsState.page} of ${pageCount}</span><button class="small-action" type="button" data-report-page="1" ${reportsState.page >= pageCount ? 'disabled' : ''}>Next</button></div></div>
+        <p class="subtle">CSV exports are audited. Excel, PDF, scheduled delivery, custom queries, and AI reporting are not enabled unless an approved integration is configured.</p>
+      </section>
     </section>
   `;
 }
@@ -3292,6 +3875,145 @@ async function handleUserAccessToggle(event) {
   await updateUserAccess(user.id, user.role, !user.active);
 }
 
+function getDashboardRolePresets() {
+  const role = String(authState.user?.role || 'ADMIN').toUpperCase();
+  return {
+    ADMIN: ['sales', 'purchases', 'cash', 'receivables', 'payables', 'inventory', 'forecast', 'inventory-health', 'procurement', 'workforce', 'budget', 'ai-summary'],
+    MANAGER: ['sales', 'purchases', 'cash', 'inventory', 'procurement', 'forecast', 'inventory-health', 'ai-summary'],
+    FINANCE: ['cash', 'receivables', 'payables', 'budget', 'forecast', 'ai-summary'],
+    HR: ['workforce', 'cash', 'inventory', 'ai-summary'],
+    SELLER: ['sales', 'receivables', 'forecast', 'ai-summary'],
+    default: ['sales', 'purchases', 'cash', 'inventory', 'forecast', 'ai-summary'],
+  }[role] || ['sales', 'purchases', 'cash', 'inventory', 'forecast', 'ai-summary'];
+}
+
+function getDashboardConfig() {
+  const fallback = {
+    role: authState.user?.role || 'ADMIN',
+    enabled: getDashboardRolePresets(),
+    showConfig: false,
+  };
+
+  try {
+    const stored = localStorage.getItem('erp-dashboard-config');
+    if (!stored) return fallback;
+    const parsed = JSON.parse(stored) || {};
+    const enabled = Array.isArray(parsed.enabled) && parsed.enabled.length
+      ? parsed.enabled
+      : fallback.enabled;
+    return {
+      ...fallback,
+      ...parsed,
+      enabled,
+      role: authState.user?.role || parsed.role || 'ADMIN',
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveDashboardConfig(config) {
+  localStorage.setItem('erp-dashboard-config', JSON.stringify(config));
+}
+
+function buildDashboardIntelligence() {
+  const metrics = dashboardState.metrics || {};
+  const trend = dashboardState.trend || [];
+  const inventoryItems = applicationData.inventoryItems || [];
+  const purchaseOrders = applicationData.purchaseOrders || [];
+  const productionOrders = applicationData.productionOrders || [];
+  const employees = applicationData.employees || [];
+  const attendanceRecords = applicationData.attendanceRecords || [];
+  const bankAccounts = applicationData.bankAccounts || [];
+  const financeLedger = applicationData.financeLedger || [];
+
+  const moneyFormatter = (value) => new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: dashboardState.currency || 'ETB',
+    maximumFractionDigits: 0,
+  }).format(Number(value) || 0);
+
+  const salesRevenue = Number(metrics.sales?.value || 0);
+  const salesPrevious = Number(metrics.sales?.previousValue || 0);
+  const salesGrowth = salesPrevious > 0 ? ((salesRevenue - salesPrevious) / salesPrevious) * 100 : salesRevenue > 0 ? 100 : 0;
+  const salesForecast = trend.length > 1
+    ? Number(trend[trend.length - 1]?.sales || 0) * (1 + (salesGrowth > 0 ? salesGrowth : 0) / 100)
+    : salesRevenue;
+
+  const purchaseValue = purchaseOrders.reduce((sum, order) => sum + Number(order.amount || 0), 0);
+  const onHandUnits = inventoryItems.reduce((sum, item) => sum + Number(item.stock || 0), 0);
+  const lowStockItems = inventoryItems.filter((item) => Number(item.stock || 0) <= Number(item.reorderLevel || 0));
+  const slowMoving = inventoryItems.filter((item) => Number(item.stock || 0) > 0 && Number(item.stock || 0) < Number(item.reorderLevel || 0) * 1.25);
+  const inventoryTurnover = Number(Math.max(0, salesRevenue / Math.max(onHandUnits || 1, 1)).toFixed(2));
+  const stockoutRisk = Math.min(100, Math.round((lowStockItems.length / Math.max(inventoryItems.length, 1)) * 100));
+
+  const procurementSpend = purchaseOrders.reduce((sum, order) => sum + Number(order.amount || 0), 0);
+  const supplierHealth = purchaseOrders.length
+    ? Math.min(100, Math.round((procurementSpend / Math.max(salesRevenue || 1, 1)) * 100))
+    : 0;
+
+  const completedProduction = productionOrders.filter((order) => Number(order.completed || 0) >= Number(order.quantity || 0)).length;
+  const productionCompletion = productionOrders.length
+    ? Math.round((productionOrders.reduce((sum, order) => sum + Number(order.completed || 0), 0) / productionOrders.reduce((sum, order) => sum + Number(order.quantity || 0), 0)) * 100)
+    : 0;
+  const manufacturingVariance = productionOrders.length
+    ? Math.round((productionOrders.reduce((sum, order) => sum + (Number(order.quantity || 0) - Number(order.completed || 0)), 0) / productionOrders.reduce((sum, order) => sum + Number(order.quantity || 0), 0)) * 100)
+    : 0;
+
+  const attendanceRate = attendanceRecords.length
+    ? Math.round((attendanceRecords.filter((record) => String(record.status || '').toLowerCase() === 'present').length / attendanceRecords.length) * 100)
+    : 0;
+  const workforceUtilization = employees.length
+    ? Math.min(100, Math.round((employees.filter((employee) => String(employee.status || '').toLowerCase() === 'active').length / employees.length) * 100))
+    : 0;
+  const leaveBalance = employees.length
+    ? employees.reduce((sum, employee) => sum + Number(employee.leaveBalance || 0), 0)
+    : 0;
+
+  const bankBalance = bankAccounts.reduce((sum, account) => sum + Number(account.balance || account.openingBalance || 0), 0);
+  const cashFlow = financeLedger.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+  const receivables = Number(metrics.receivables?.value || 0);
+  const payables = Number(metrics.payables?.value || 0);
+  const budgetVariance = salesRevenue > 0 ? Math.max(0, Math.round(((salesRevenue - purchaseValue) / Math.max(salesRevenue, 1)) * 100)) : 0;
+
+  const alerts = [
+    ...(lowStockItems.length ? [{ label: `${lowStockItems.length} items require replenishment`, menu: 'inventory', tone: 'warning' }] : []),
+    ...(receivables > 0 ? [{ label: `Receivables outstanding: ${moneyFormatter(receivables)}`, menu: 'sales', tone: 'critical' }] : []),
+    ...(stockoutRisk >= 40 ? [{ label: 'Inventory risk is rising across key stock lines', menu: 'inventory', tone: 'warning' }] : []),
+    ...(attendanceRate < 85 ? [{ label: 'Attendance is below target for the selected period', menu: 'hr', tone: 'critical' }] : []),
+  ];
+
+  const aiSummary = `AI-generated summary: revenue is ${salesGrowth >= 0 ? 'up' : 'down'} by ${Math.abs(salesGrowth).toFixed(1)}% versus the prior period. ${lowStockItems.length} stock lines are at or below reorder thresholds, while ${completedProduction} production orders are on track. Recommended action: prioritize replenishment and cash collection from the outstanding receivables pipeline.`;
+
+  return {
+    salesForecast,
+    inventoryTurnover,
+    stockoutRisk,
+    slowMoving: slowMoving.length,
+    supplierHealth,
+    procurementSpend,
+    utilization: productionCompletion,
+    manufacturingVariance,
+    attendanceRate,
+    workforceUtilization,
+    leaveBalance,
+    cashFlow,
+    bankBalance,
+    budgetVariance,
+    alerts,
+    aiSummary,
+    widgets: [
+      { key: 'forecast', label: 'Forecast', value: moneyFormatter(salesForecast), note: 'Projected revenue' },
+      { key: 'inventory-health', label: 'Inventory health', value: `${stockoutRisk}%`, note: `${lowStockItems.length} risk items` },
+      { key: 'procurement', label: 'Procurement', value: moneyFormatter(procurementSpend), note: `${purchaseOrders.length} active orders` },
+      { key: 'workforce', label: 'Workforce', value: `${attendanceRate}%`, note: `${employees.length} employees` },
+      { key: 'budget', label: 'Budget vs actual', value: `${budgetVariance}%`, note: 'vs planned run-rate' },
+    ],
+    receivables,
+    payables,
+  };
+}
+
 function renderDashboard() {
   const currency = (value) => new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -3306,6 +4028,10 @@ function renderDashboard() {
     ['payables', 'Payables', 'finance', 'Posted Accounts Payable ledger balance', '◷'],
     ['inventory', 'Inventory value', 'inventory', 'Posted stock movements at recorded cost', '▦'],
   ];
+  const dashboardConfig = getDashboardConfig();
+  const dashboardIntelligence = buildDashboardIntelligence();
+  const availableWidgetKeys = ['forecast', 'inventory-health', 'procurement', 'workforce', 'budget'];
+  const dashboardWidgets = dashboardIntelligence.widgets.filter((widget) => dashboardConfig.enabled.includes(widget.key));
   const cards = definitions.filter(([key]) => dashboardState.metrics[key]).map(([key, title, menu, note, icon]) => {
     const metric = dashboardState.metrics[key];
     const hasComparison = ['sales', 'purchases'].includes(key);
@@ -3353,7 +4079,7 @@ function renderDashboard() {
     : seriesOptions[0]?.[0];
   const values = dashboardState.trend.map((point) => Number(point[selectedSeries] || 0));
   const peak = Math.max(...values, 1);
-  const bars = dashboardState.trend.map((point, index) => {
+  const bars = dashboardState.trend.map((point) => {
     const date = new Date(`${String(point.date).slice(0, 10)}T00:00:00`);
     const label = Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
     const amount = Number(point[selectedSeries] || 0);
@@ -3371,8 +4097,27 @@ function renderDashboard() {
   return `<section class="dashboard-page">
     <div class="dashboard-hero">
       <div><p class="eyebrow">Business at a glance</p><h2>Welcome back, ${escapeHtml(authState.user.name)}</h2><p>Your key business numbers, live from PostgreSQL.</p></div>
-      <button class="primary-btn dashboard-refresh" type="button" data-dashboard-refresh ${dashboardState.loading ? 'disabled' : ''}>${dashboardState.loading ? 'Refreshing…' : '↻ Refresh data'}</button>
+      <div class="dashboard-hero-actions">
+        <button class="secondary-btn dashboard-config-toggle" type="button" data-dashboard-config-toggle>${dashboardConfig.showConfig ? 'Hide widgets' : 'Customize dashboard'}</button>
+        <button class="primary-btn dashboard-refresh" type="button" data-dashboard-refresh ${dashboardState.loading ? 'disabled' : ''}>${dashboardState.loading ? 'Refreshing…' : '↻ Refresh data'}</button>
+      </div>
     </div>
+    ${dashboardConfig.showConfig ? `<section class="dashboard-config-panel">
+      <div class="dashboard-panel-heading"><div><p class="eyebrow">Dashboard setup</p><h3>Widget visibility</h3></div><span>${dashboardConfig.enabled.length} active</span></div>
+      <div class="dashboard-config-grid">
+        ${availableWidgetKeys.map((key) => {
+          const widget = dashboardIntelligence.widgets.find((item) => item.key === key) || { label: key, note: '' };
+          const checked = dashboardConfig.enabled.includes(key) ? 'checked' : '';
+          return `<label class="dashboard-config-option">
+            <input type="checkbox" value="${key}" data-dashboard-widget-toggle ${checked} />
+            <span>
+              <strong>${escapeHtml(widget.label)}</strong>
+              <small>${escapeHtml(widget.note || 'Visible on the dashboard')}</small>
+            </span>
+          </label>`;
+        }).join('')}
+      </div>
+    </section>` : ''}
     ${moduleCards ? `<section class="dashboard-module-launcher" aria-labelledby="dashboard-modules-title"><div class="dashboard-module-heading"><div><p class="eyebrow">Your workspace</p><h3 id="dashboard-modules-title">Modules</h3></div><span>${moduleDefinitions.filter(([menu]) => canAccessMenu(menu)).length} available</span></div><div class="dashboard-module-grid">${moduleCards}</div></section>` : ''}
     ${dashboardState.error ? `<p class="dashboard-error" role="alert">Live dashboard data could not be loaded: ${escapeHtml(dashboardState.error)}</p>` : ''}
     ${cards ? `<div class="dashboard-kpi-grid">${cards}</div>` : `<section class="dashboard-empty"><strong>No dashboard metrics are available for this account.</strong><span>Ask your administrator for access to the relevant finance, sales, inventory, or procurement reports.</span></section>`}
@@ -3392,7 +4137,93 @@ function renderDashboard() {
         <p class="dashboard-data-note">${escapeHtml(updatedLabel)} · Currency: ${escapeHtml(dashboardState.currency)}</p>
       </aside>
     </div>
+    ${dashboardWidgets.length ? `<section class="dashboard-intelligence">
+      <div class="dashboard-panel-heading dashboard-intelligence-head"><div><p class="eyebrow">Intelligence</p><h3>Business insights</h3></div><span>${dashboardConfig.enabled.length} configured widgets</span></div>
+      <div class="dashboard-intelligence-grid">
+        ${dashboardWidgets.map((widget) => `
+          <div class="dashboard-intel-card">
+            <span class="dashboard-intel-label">${escapeHtml(widget.label)}</span>
+            <strong>${escapeHtml(widget.value)}</strong>
+            <small>${escapeHtml(widget.note)}</small>
+          </div>
+        `).join('')}
+      </div>
+      <div class="dashboard-ai-summary">
+        <p class="eyebrow">AI-generated business summary</p>
+        <p>${escapeHtml(dashboardIntelligence.aiSummary)}</p>
+      </div>
+      ${dashboardIntelligence.alerts.length ? `<div class="dashboard-alerts">
+        ${dashboardIntelligence.alerts.map((alert) => `
+          <button type="button" class="dashboard-alert-item ${alert.tone}" data-menu="${alert.menu}">
+            <span>${escapeHtml(alert.label)}</span>
+            <i>↗</i>
+          </button>
+        `).join('')}
+      </div>` : ''}
+    </section>` : ''}
   </section>`;
+}
+
+function canUseAssistant() {
+  return ['sales:orders:read', 'sales:reports:read', 'inventory:reports:view', 'procurement:orders:read',
+    'manufacturing:read', 'hr:employees:read', 'accounting:reports:view', 'finance:transactions:create']
+    .some(hasRolePermission);
+}
+
+function renderAssistantPanel() {
+  if (!canUseAssistant()) return '';
+  const messages = assistantState.messages.map((message) => `<article class="assistant-message ${message.role}" aria-label="${message.role === 'assistant' ? 'AI-assisted response' : 'Your question'}">
+    <strong>${message.role === 'assistant' ? 'AI-assisted' : 'You'}</strong>
+    <p>${escapeHtml(message.text)}</p>
+    ${message.details ? `<small>${escapeHtml(message.details)}</small>` : ''}
+  </article>`).join('');
+  return `<aside class="erp-assistant ${assistantState.open ? 'open' : ''}" aria-label="Optional ERP assistant">
+    ${assistantState.open ? `<section class="assistant-panel" aria-labelledby="assistant-title">
+      <header><div><p class="eyebrow">Optional · permission-aware</p><h2 id="assistant-title">ERP assistant</h2></div><button type="button" class="assistant-close" data-assistant-close aria-label="Close assistant">×</button></header>
+      <p class="assistant-disclaimer">Suggestions only. No transaction, approval, payment, stock change, or posting can be executed here. Private business data is sent externally only when an administrator explicitly configures an AI provider.</p>
+      <div class="assistant-quick-prompts"><button type="button" data-assistant-prompt="Summarize my authorized business performance">Summarize performance</button><button type="button" data-assistant-prompt="How do I navigate my available modules?">Help me navigate</button></div>
+      <div class="assistant-messages" role="log" aria-live="polite" aria-relevant="additions">${messages || '<p class="assistant-empty">Ask about your authorized business metrics or how to use an available module.</p>'}${assistantState.loading ? '<p class="assistant-loading" role="status">Preparing a permission-filtered response…</p>' : ''}</div>
+      ${assistantState.error ? `<p class="assistant-error" role="alert">${escapeHtml(assistantState.error)}</p>` : ''}
+      <form data-assistant-form><label for="assistant-question">Question</label><textarea id="assistant-question" name="question" maxlength="1500" rows="3" required placeholder="Ask about sales, stock, workflows, or a report…"></textarea><button class="primary-btn" type="submit" ${assistantState.loading ? 'disabled' : ''}>${assistantState.loading ? 'Working…' : 'Ask assistant'}</button></form>
+      <small class="assistant-privacy">Only authorized aggregate metrics are sent to an explicitly configured provider. Prompts and answers are not stored in the ERP database.</small>
+    </section>` : ''}
+    <button type="button" class="assistant-launcher" data-assistant-toggle aria-expanded="${assistantState.open}" aria-label="${assistantState.open ? 'Close ERP assistant' : 'Open ERP assistant'}" title="${assistantState.open ? 'Close ERP assistant' : 'Open ERP assistant'}">
+      ${assistantState.open
+        ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>'
+        : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5a7.5 7.5 0 1 1 17-3Z" /><path d="M8 11h.01M12 11h.01M16 11h.01" /></svg>'}
+    </button>
+  </aside>`;
+}
+
+async function sendAssistantMessage(question) {
+  const normalized = String(question || '').trim();
+  if (!normalized || assistantState.loading) return;
+  assistantState.messages.push({ role: 'user', text: normalized });
+  assistantState.messages = assistantState.messages.slice(-20);
+  assistantState.loading = true;
+  assistantState.error = '';
+  render();
+  try {
+    const response = await fetchJson('/api/assistant/chat', {
+      method: 'POST',
+      body: JSON.stringify({ question: normalized, range: state.selectedRange }),
+    });
+    const source = response.sourceMetrics?.length
+      ? `Sources: ${response.sourceMetrics.join(', ')} · Period: ${response.period?.start || ''} to ${response.period?.end || response.reportingRange}`
+      : `Workflow help · Available modules: ${response.authorizedModules.join(', ') || 'none'}`;
+    assistantState.messages.push({
+      role: 'assistant',
+      text: response.answer,
+      details: `AI-assisted · ${response.providerMode === 'external_configured' ? 'Configured provider' : 'Local mode'} · ${source} · No action performed`,
+    });
+    assistantState.messages = assistantState.messages.slice(-20);
+  } catch (error) {
+    assistantState.error = error.message;
+    assistantState.messages.push({ role: 'assistant', text: `Unable to answer: ${error.message}`, details: 'No ERP action was performed.' });
+  } finally {
+    assistantState.loading = false;
+    render();
+  }
 }
 
 function renderLogin() {
@@ -3443,6 +4274,62 @@ function renderLogin() {
   `;
 }
 
+function renderProjects() {
+  const canManage = hasRolePermission('projects:manage');
+  const projectStatusOptions = ['PLANNED', 'ACTIVE', 'ON_HOLD', 'COMPLETED', 'CANCELLED'];
+  const taskStatusOptions = ['OPEN', 'IN_PROGRESS', 'BLOCKED', 'COMPLETED'];
+  return `
+    <section class="content-panel">
+      <div class="panel-header">
+        <div><p class="eyebrow">Project delivery</p><h2>Projects and tasks</h2></div>
+        <button type="button" class="secondary-btn" data-project-refresh>Refresh</button>
+      </div>
+      <p class="subtle">Projects and tasks are stored within your organization. Project status changes and new records are audited.</p>
+      ${projectsState.error ? `<p class="accounting-error" role="alert">${escapeHtml(projectsState.error)}</p>` : ''}
+      ${canManage ? `
+        <form class="report-saved-controls" data-project-form>
+          <label>Project code<input name="code" required maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" /></label>
+          <label>Project name<input name="name" required maxlength="160" /></label>
+          <label>Start date<input name="startDate" type="date" /></label>
+          <label>Due date<input name="dueDate" type="date" /></label>
+          <label>Description<input name="description" maxlength="1000" /></label>
+          <button class="primary-btn" type="submit">Create project</button>
+        </form>` : ''}
+      ${projectsState.loading ? '<p class="subtle" role="status">Loading projects…</p>' : ''}
+      ${projectsState.projects.length ? projectsState.projects.map((project) => `
+        <article class="content-panel">
+          <div class="panel-header">
+            <div><p class="eyebrow">${escapeHtml(project.code)}</p><h3>${escapeHtml(project.name)}</h3></div>
+            ${canManage ? `<form class="button-row" data-project-status-form data-project-id="${escapeHtml(project.id)}">
+              <label class="subtle">Status<select name="status">${projectStatusOptions.map((status) => `<option value="${status}" ${status === project.status ? 'selected' : ''}>${status.replaceAll('_', ' ')}</option>`).join('')}</select></label>
+              <button class="small-action" type="submit">Update</button>
+            </form>` : `<span class="pill neutral">${escapeHtml(project.status)}</span>`}
+          </div>
+          <p>${escapeHtml(project.description || 'No project description provided.')}</p>
+          <p class="subtle">Start: ${escapeHtml(project.startDate || 'Not set')} · Due: ${escapeHtml(project.dueDate || 'Not set')} · ${project.tasks.length} task${project.tasks.length === 1 ? '' : 's'}</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Task</th><th>Due date</th><th>Status</th></tr></thead>
+            <tbody>${project.tasks.length ? project.tasks.map((task) => `<tr>
+              <td><strong>${escapeHtml(task.title)}</strong>${task.description ? `<small class="table-note">${escapeHtml(task.description)}</small>` : ''}</td>
+              <td>${escapeHtml(task.dueDate || 'Not set')}</td>
+              <td>${canManage ? `<form class="button-row" data-project-status-form data-project-id="${escapeHtml(project.id)}" data-task-id="${escapeHtml(task.id)}">
+                <label class="subtle"><span class="sr-only">Task status</span><select name="status">${taskStatusOptions.map((status) => `<option value="${status}" ${status === task.status ? 'selected' : ''}>${status.replaceAll('_', ' ')}</option>`).join('')}</select></label>
+                <button class="small-action" type="submit">Update</button>
+              </form>` : escapeHtml(task.status)}</td>
+            </tr>`).join('') : '<tr><td colspan="3" class="empty-state">No tasks have been added yet.</td></tr>'}</tbody>
+          </table></div>
+          ${canManage ? `<form class="report-saved-controls" data-project-form data-project-id="${escapeHtml(project.id)}">
+            <label>Task title<input name="title" required maxlength="160" /></label>
+            <label>Due date<input name="dueDate" type="date" /></label>
+            <label>Description<input name="description" maxlength="1000" /></label>
+            <button class="secondary-btn" type="submit">Add task</button>
+          </form>` : ''}
+        </article>
+      `).join('') : '<p class="empty-state">No projects have been created for this organization.</p>'}
+    </section>
+  `;
+}
+
 function renderPage() {
   switch (state.activeMenu) {
     case 'sales':
@@ -3459,6 +4346,8 @@ function renderPage() {
       return renderBanking();
     case 'manufacturing':
       return renderManufacturing();
+    case 'projects':
+      return renderProjects();
     case 'reports':
       return renderReports();
     case 'settings':
@@ -3549,6 +4438,7 @@ function render() {
         <nav class="nav-menu" aria-label="Primary navigation">
           ${navSections}
         </nav>
+        ${renderQuickNavigation()}
 
         <div class="sidebar-footer">
           <span class="status-dot"></span>
@@ -3567,6 +4457,7 @@ function render() {
           </div>
           <div class="top-actions">
             <div class="user-badge"><span class="user-avatar">${authState.user.name.charAt(0).toUpperCase()}</span><span>${authState.user.name} · ${authState.user.role}</span></div>
+            <button type="button" class="favorite-current-page" data-favorite-toggle aria-pressed="${getNavigationPreferences('favorites').includes(navigationState.key)}" aria-label="${getNavigationPreferences('favorites').includes(navigationState.key) ? 'Remove page from favorites' : 'Add page to favorites'}">${getNavigationPreferences('favorites').includes(navigationState.key) ? '★' : '☆'} Favorite</button>
             <select id="range-select" aria-label="Reporting period">
               ${rangeOptions
                 .map(
@@ -3588,8 +4479,35 @@ function render() {
               ? `<section class="content-panel" role="alert"><p class="eyebrow">Workspace unavailable</p><h2>Unable to load ERP data</h2><p class="subtle">${escapeHtml(authState.dataLoadError)}</p><button class="primary-btn" type="button" data-app-retry>Retry</button></section>`
               : renderPage()}
       </main>
+      ${renderAssistantPanel()}
     </div>
   `;
+
+  document.querySelector('[data-assistant-toggle]')?.addEventListener('click', () => {
+    assistantState.open = !assistantState.open;
+    render();
+    if (assistantState.open) document.getElementById('assistant-question')?.focus();
+  });
+  document.querySelector('[data-assistant-close]')?.addEventListener('click', () => {
+    assistantState.open = false;
+    render();
+  });
+  document.querySelector('[data-assistant-form]')?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const question = new FormData(form).get('question');
+    void sendAssistantMessage(question);
+  });
+  document.querySelectorAll('[data-assistant-prompt]').forEach((button) => {
+    button.addEventListener('click', () => sendAssistantMessage(button.dataset.assistantPrompt));
+  });
+  document.querySelector('[data-favorite-toggle]')?.addEventListener('click', () => toggleFavoritePage(navigationState.key));
+  document.querySelector('.assistant-panel')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      assistantState.open = false;
+      render();
+    }
+  });
 
   document.querySelectorAll('[data-route-key]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -3611,6 +4529,16 @@ function render() {
   });
   document.querySelector('[data-governance-refresh]')?.addEventListener('click', async () => {
     await loadGovernanceData();
+    render();
+  });
+  document.querySelectorAll('[data-project-form]').forEach((form) => {
+    form.addEventListener('submit', handleProjectFormSubmit);
+  });
+  document.querySelectorAll('[data-project-status-form]').forEach((form) => {
+    form.addEventListener('submit', handleProjectStatusSubmit);
+  });
+  document.querySelector('[data-project-refresh]')?.addEventListener('click', async () => {
+    await loadProjectsData();
     render();
   });
 
@@ -3638,10 +4566,12 @@ function render() {
   if (rangeSelect) {
     rangeSelect.addEventListener('change', async (event) => {
       state.selectedRange = event.target.value;
-      const request = loadDashboardData();
+      reportsState.range = state.selectedRange;
+      const requests = [loadDashboardData()];
+      if (canAccessMenu('reports')) requests.push(loadReportsData());
       render();
-      await request;
-      if (state.activeMenu === 'dashboard') render();
+      await Promise.all(requests);
+      if (['dashboard', 'reports'].includes(state.activeMenu)) render();
     });
   }
 
@@ -3650,6 +4580,27 @@ function render() {
     render();
     await request;
     if (state.activeMenu === 'dashboard') render();
+  });
+  document.querySelector('[data-dashboard-config-toggle]')?.addEventListener('click', () => {
+    const config = getDashboardConfig();
+    config.showConfig = !config.showConfig;
+    saveDashboardConfig(config);
+    render();
+  });
+  document.querySelectorAll('[data-dashboard-widget-toggle]').forEach((checkbox) => {
+    checkbox.addEventListener('change', (event) => {
+      const config = getDashboardConfig();
+      const key = event.currentTarget.value;
+      const enabled = new Set(config.enabled || []);
+      if (event.currentTarget.checked) {
+        enabled.add(key);
+      } else {
+        enabled.delete(key);
+      }
+      config.enabled = [...enabled];
+      saveDashboardConfig(config);
+      render();
+    });
   });
   document.querySelectorAll('[data-dashboard-series]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -3664,6 +4615,60 @@ function render() {
 
   const exportButton = document.getElementById('export-report');
   if (exportButton) exportButton.addEventListener('click', exportReport);
+  document.querySelector('[data-report-filter-form]')?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    reportsState.filter = String(new FormData(event.currentTarget).get('filter') || '').trim();
+    reportsState.page = 1;
+    render();
+  });
+  document.querySelector('[data-report-save-form]')?.addEventListener('submit', saveReportConfiguration);
+  document.getElementById('report-period')?.addEventListener('change', async (event) => {
+    reportsState.range = event.currentTarget.value;
+    reportsState.page = 1;
+    await loadReportsData();
+    render();
+  });
+  document.getElementById('report-page-size')?.addEventListener('change', (event) => {
+    reportsState.pageSize = Number(event.currentTarget.value);
+    reportsState.page = 1;
+    render();
+  });
+  document.querySelectorAll('[data-report-column]').forEach((checkbox) => {
+    checkbox.addEventListener('change', (event) => {
+      const column = event.currentTarget.dataset.reportColumn;
+      const selected = new Set(reportsState.columns);
+      if (event.currentTarget.checked) selected.add(column);
+      else selected.delete(column);
+      if (!selected.size) {
+        reportsState.error = 'Select at least one report column.';
+        event.currentTarget.checked = true;
+        render();
+        return;
+      }
+      reportsState.columns = [...selected];
+      reportsState.error = '';
+      render();
+    });
+  });
+  document.querySelectorAll('[data-report-sort]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const column = button.dataset.reportSort;
+      reportsState.sortDirection = reportsState.sortBy === column && reportsState.sortDirection === 'asc' ? 'desc' : 'asc';
+      reportsState.sortBy = column;
+      render();
+    });
+  });
+  document.querySelectorAll('[data-report-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      reportsState.page += Number(button.dataset.reportPage);
+      render();
+    });
+  });
+  document.querySelectorAll('[data-report-drilldown]').forEach((button) => {
+    button.addEventListener('click', () => navigateTo(button.dataset.reportDrilldown));
+  });
+  document.getElementById('report-saved-view')?.addEventListener('change', applySavedReportConfiguration);
+  document.querySelector('[data-report-delete-saved]')?.addEventListener('click', deleteSavedReportConfiguration);
 
   document.getElementById('refresh-settings')?.addEventListener('click', (event) => refreshSettings(event.currentTarget));
   document.querySelector('[data-user-access-form]')?.addEventListener('submit', handleUserAccessSubmit);
@@ -3933,8 +4938,37 @@ function render() {
     render();
   });
   document.querySelectorAll('[data-sales-form]').forEach((form) => form.addEventListener('submit', handleSalesFormSubmit));
+  document.querySelector('[data-sales-performance-range]')?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    if (values.startDate > values.endDate) {
+      window.alert('The start date must be on or before the end date.');
+      return;
+    }
+    salesState.performanceStart = values.startDate;
+    salesState.performanceEnd = values.endDate;
+    await loadSalesData();
+    render();
+  });
   document.querySelectorAll('[data-sales-action]').forEach((button) => {
     button.addEventListener('click', () => handleSalesAction(button.dataset.salesId, button.dataset.salesAction));
+  });
+  document.querySelectorAll('[data-crm-stage]').forEach((select) => {
+    select.addEventListener('change', async (event) => {
+      const control = event.currentTarget;
+      control.disabled = true;
+      try {
+        await fetchJson(`/api/sales/crm/${encodeURIComponent(control.dataset.crmStage)}`, {
+          method: 'PUT',
+          body: JSON.stringify({ stage: control.value }),
+        });
+        await loadSalesData();
+        render();
+      } catch (error) {
+        window.alert(error.message);
+        render();
+      }
+    });
   });
   document.querySelectorAll('[data-finance-tab]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -3958,6 +4992,9 @@ function render() {
   });
   document.querySelectorAll('[data-accounting-close-period]').forEach((button) => {
     button.addEventListener('click', () => closeAccountingPeriodInUi(button.dataset.accountingClosePeriod));
+  });
+  document.querySelectorAll('[data-accounting-reopen-period]').forEach((button) => {
+    button.addEventListener('click', () => reopenAccountingPeriodInUi(button.dataset.accountingReopenPeriod));
   });
   document.querySelector('[data-accounting-refresh]')?.addEventListener('click', async () => {
     await loadAccountingData();
@@ -4095,6 +5132,7 @@ async function handleHrFormSubmit(event) {
     'leave-request': ['/api/hr/leave/requests', 'POST'],
     'payroll-period': ['/api/hr/payroll/periods', 'POST'],
     'payroll-settings': ['/api/hr/payroll/settings', 'PUT'],
+    'employee-document': ['/api/hr/employee-documents', 'POST'],
   };
   const route = routes[type];
   if (!route) return;

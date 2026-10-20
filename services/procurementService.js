@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { accountingService } from './accountingService.js';
+import { inventoryService } from './inventoryService.js';
 import { isValidBusinessCode, isValidEmail, isValidPersonName, isValidPhone } from '../validation.js';
 
 export class ProcurementError extends Error {
@@ -37,7 +39,7 @@ async function addHistory(client, organizationId, actorId, entityType, entityId,
 }
 
 export async function getProcurementWorkspace(client, organizationId) {
-  const [suppliers, comparisons, quotes, orders, history, requisitions, supplierInvoices, scorecards] = await Promise.all([
+  const [suppliers, comparisons, quotes, orders, history, requisitions, supplierInvoices, scorecards, supplierDocuments, warehouses] = await Promise.all([
     client.query(
       `SELECT id, supplier_code, name, contact_name, email, phone, payment_terms, notes, active, created_at,
               qualification_status, risk_level
@@ -63,15 +65,17 @@ export async function getProcurementWorkspace(client, organizationId) {
       [organizationId],
     ),
     client.query(
-      `SELECT po.*, s.name AS supplier_name, c.title AS comparison_title,
+      `SELECT po.*, s.name AS supplier_name, c.title AS comparison_title, c.sku AS comparison_sku,
               c.quantity AS ordered_quantity, q.unit_price, q.tax_rate, q.tax_amount,
               q.shipping_cost, q.other_cost, q.payment_terms, q.delivery_days,
+              product.sku AS inventory_product_sku,
               ROUND(c.quantity * q.unit_price + q.tax_amount + q.shipping_cost + q.other_cost, 2) AS total_cost,
               creator.display_name AS created_by_name, approver.display_name AS approved_by_name
        FROM procurement_purchase_orders po
        JOIN procurement_suppliers s ON s.id = po.supplier_id
        JOIN procurement_comparisons c ON c.id = po.comparison_id
        JOIN procurement_supplier_quotes q ON q.id = po.quote_id
+       LEFT JOIN inventory_products product ON product.id=po.inventory_product_id AND product.organization_id=po.organization_id
        LEFT JOIN users creator ON creator.id = po.created_by
        LEFT JOIN users approver ON approver.id = po.approved_by
        WHERE po.organization_id = $1
@@ -117,6 +121,22 @@ export async function getProcurementWorkspace(client, organizationId) {
        WHERE supplier.organization_id=$1
        GROUP BY supplier.id ORDER BY spend DESC, supplier.name`, [organizationId],
     ),
+    client.query(
+       `SELECT document.*, supplier.name AS supplier_name, supplier.supplier_code,
+               CASE WHEN document.expiry_date < CURRENT_DATE THEN 'EXPIRED'
+                    WHEN document.expiry_date <= CURRENT_DATE + INTERVAL '30 days' THEN 'EXPIRING_SOON'
+                    ELSE 'CURRENT' END AS expiry_status
+        FROM procurement_supplier_documents document
+        JOIN procurement_suppliers supplier ON supplier.id=document.supplier_id
+        WHERE document.organization_id=$1
+        ORDER BY document.expiry_date NULLS LAST, supplier.name, document.document_name`,
+       [organizationId],
+    ),
+    client.query(
+       `SELECT id, code, name FROM inventory_warehouses
+        WHERE organization_id=$1 AND active=TRUE ORDER BY name`,
+       [organizationId],
+    ),
   ]);
   const quotesByComparison = new Map();
   for (const quote of quotes.rows) {
@@ -145,6 +165,8 @@ export async function getProcurementWorkspace(client, organizationId) {
     requisitions: requisitions.rows,
     supplierInvoices: supplierInvoices.rows,
     scorecards: scorecards.rows,
+    supplierDocuments: supplierDocuments.rows,
+    warehouses: warehouses.rows,
   };
 }
 
@@ -168,6 +190,47 @@ export async function createSupplier(client, organizationId, actorId, input) {
       ['LOW', 'MEDIUM', 'HIGH'].includes(input.riskLevel) ? input.riskLevel : 'MEDIUM'],
   );
   await addHistory(client, organizationId, actorId, 'SUPPLIER', result.rows[0].id, 'SUPPLIER_CREATED');
+  return result.rows[0];
+}
+
+export async function createSupplierDocument(client, organizationId, actorId, input) {
+  const supplierId = String(input.supplierId || '').trim();
+  const documentType = String(input.documentType || '').trim();
+  const documentName = String(input.documentName || '').trim();
+  const referenceUrl = String(input.referenceUrl || '').trim() || null;
+  const expiryDate = String(input.expiryDate || '').trim() || null;
+  if (!supplierId || !documentType || !documentName) {
+    throw new ProcurementError(400, 'Supplier, document type, and document name are required.');
+  }
+  if (documentType.length > 80 || documentName.length > 180) {
+    throw new ProcurementError(400, 'Document type or name exceeds the allowed length.');
+  }
+  if (expiryDate && (!/^\d{4}-\d{2}-\d{2}$/.test(expiryDate)
+    || Number.isNaN(Date.parse(`${expiryDate}T00:00:00Z`))
+    || new Date(`${expiryDate}T00:00:00Z`).toISOString().slice(0, 10) !== expiryDate)) {
+    throw new ProcurementError(400, 'Expiry date must be a real calendar date in YYYY-MM-DD format.');
+  }
+  if (referenceUrl) {
+    try {
+      const parsed = new URL(referenceUrl);
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Unsupported URL protocol.');
+    } catch {
+      throw new ProcurementError(400, 'Document reference must be a valid HTTP or HTTPS URL.');
+    }
+  }
+  const result = await client.query(
+    `INSERT INTO procurement_supplier_documents
+       (organization_id, supplier_id, document_type, document_name, reference_url, expiry_date, created_by)
+     SELECT $1, supplier.id, $3, $4, $5, $6, $7
+     FROM procurement_suppliers supplier
+     WHERE supplier.id=$2 AND supplier.organization_id=$1 AND supplier.active=TRUE
+     RETURNING *`,
+    [organizationId, supplierId, documentType, documentName, referenceUrl, expiryDate, actorId],
+  );
+  if (!result.rows[0]) throw new ProcurementError(404, 'Active supplier not found.');
+  await addHistory(client, organizationId, actorId, 'SUPPLIER', supplierId, 'SUPPLIER_DOCUMENT_ADDED', null, {
+    documentId: result.rows[0].id, documentType, documentName, expiryDate,
+  });
   return result.rows[0];
 }
 
@@ -325,17 +388,65 @@ export async function receivePurchaseOrder(client, organizationId, actorId, orde
   const reason = String(input.reason || '').trim();
   if (!reason) throw new ProcurementError(400, 'A receipt note is required.');
   const orderResult = await client.query(
-    `SELECT po.id, po.status, po.received_quantity, c.quantity AS ordered_quantity
+    `SELECT po.id, po.status, po.received_quantity, po.inventory_product_id, po.inventory_warehouse_id,
+            c.quantity AS ordered_quantity, quote.unit_price,
+            product.sku AS inventory_product_sku
      FROM procurement_purchase_orders po
      JOIN procurement_comparisons c ON c.id = po.comparison_id
+     JOIN procurement_supplier_quotes quote ON quote.id=po.quote_id
+     LEFT JOIN inventory_products product ON product.id=po.inventory_product_id AND product.organization_id=po.organization_id
      WHERE po.id = $1 AND po.organization_id = $2
      FOR UPDATE OF po`,
     [orderId, organizationId],
   );
   if (!orderResult.rowCount) throw new ProcurementError(404, 'Purchase order not found.');
   const order = orderResult.rows[0];
+  const idempotencyKey = input.idempotencyKey ? String(input.idempotencyKey).trim() : null;
+  if (idempotencyKey && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
+    throw new ProcurementError(400, 'idempotencyKey must be a valid UUID.');
+  }
+  const productSku = String(input.productSku || order.inventory_product_sku || '').trim();
+  const warehouseId = String(input.warehouseId || order.inventory_warehouse_id || '').trim();
+  if (idempotencyKey) {
+    const previousReceipt = (await client.query(
+      `SELECT receipt.purchase_order_id, receipt.quantity, receipt.inventory_transaction_id
+       FROM procurement_purchase_order_receipts receipt
+       WHERE receipt.organization_id=$1 AND receipt.idempotency_key=$2`,
+      [organizationId, idempotencyKey],
+    )).rows[0];
+    if (previousReceipt) {
+      if (previousReceipt.purchase_order_id !== orderId) throw new ProcurementError(409, 'This idempotency key was already used for another purchase order.');
+      if (Number(previousReceipt.quantity) !== quantity
+        || Boolean(previousReceipt.inventory_transaction_id) !== Boolean(productSku && warehouseId)
+        || (previousReceipt.inventory_transaction_id
+          && (order.inventory_product_sku !== productSku || order.inventory_warehouse_id !== warehouseId))) {
+        throw new ProcurementError(409, 'This idempotency key was already used with different receipt details.');
+      }
+      return { ...order, idempotentReplay: true };
+    }
+  }
   if (!['APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED'].includes(order.status)) {
     throw new ProcurementError(409, 'Approve the purchase order before receiving stock.');
+  }
+  let product = null;
+  if (productSku || warehouseId) {
+    if (!productSku || !warehouseId) {
+      throw new ProcurementError(400, 'Choose both the inventory SKU and receiving warehouse for a stock receipt.');
+    }
+    product = order.inventory_product_id
+      ? await inventoryService.getProduct(client, organizationId, order.inventory_product_id)
+      : await inventoryService.getProductBySku(client, organizationId, productSku);
+    if (!product || !product.active || product.sku !== productSku) {
+      throw new ProcurementError(400, 'The inventory SKU must identify an active product in this organization.');
+    }
+    const warehouse = (await client.query(
+      'SELECT id FROM inventory_warehouses WHERE id=$1 AND organization_id=$2 AND active=TRUE',
+      [warehouseId, organizationId],
+    )).rows[0];
+    if (!warehouse) throw new ProcurementError(400, 'The receiving warehouse must be active and belong to this organization.');
+    if (order.inventory_warehouse_id && order.inventory_warehouse_id !== warehouseId) {
+      throw new ProcurementError(409, 'All receipts for a purchase order must use its original warehouse.');
+    }
   }
 
   const totalReceived = Number(order.received_quantity) + quantity;
@@ -343,12 +454,40 @@ export async function receivePurchaseOrder(client, organizationId, actorId, orde
     throw new ProcurementError(400, 'Received quantity cannot exceed the ordered quantity.');
   }
   const status = totalReceived === Number(order.ordered_quantity) ? 'RECEIVED' : 'PARTIALLY_RECEIVED';
-  await client.query(
+  const receipt = (await client.query(
     `INSERT INTO procurement_purchase_order_receipts
-       (organization_id, purchase_order_id, quantity, received_by, reason)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [organizationId, orderId, quantity, actorId, reason],
-  );
+       (organization_id, purchase_order_id, quantity, received_by, reason, idempotency_key)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [organizationId, orderId, quantity, actorId, reason, idempotencyKey],
+  )).rows[0];
+  let movement = null;
+  let journal = null;
+  if (product) {
+    movement = await inventoryService.receive(client, organizationId, actorId, {
+      productId: product.id,
+      warehouseId,
+      quantity,
+      unitCost: order.unit_price,
+      transactionType: 'PURCHASE_RECEIPT',
+      referenceType: 'PROCUREMENT_RECEIPT',
+      referenceId: receipt.id,
+      manageTransaction: false,
+    });
+    journal = await accountingService.postJournal(client, organizationId, actorId, movement.journal.id);
+    if (!journal) throw new ProcurementError(409, 'The inventory receipt journal could not be posted.');
+    await client.query(
+      `UPDATE procurement_purchase_order_receipts
+       SET inventory_transaction_id=$1 WHERE id=$2`,
+      [movement.transaction.id, receipt.id],
+    );
+    await client.query(
+      `UPDATE procurement_purchase_orders
+       SET inventory_product_id=COALESCE(inventory_product_id,$1),
+           inventory_warehouse_id=COALESCE(inventory_warehouse_id,$2)
+       WHERE id=$3 AND organization_id=$4`,
+      [product.id, warehouseId, orderId, organizationId],
+    );
+  }
   const updated = await client.query(
     `UPDATE procurement_purchase_orders
      SET received_quantity = $3, status = $4, updated_at = CURRENT_TIMESTAMP
@@ -358,6 +497,12 @@ export async function receivePurchaseOrder(client, organizationId, actorId, orde
   );
   await addHistory(client, organizationId, actorId, 'PURCHASE_ORDER', orderId, 'GOODS_RECEIVED', reason, {
     quantity, totalReceived, orderedQuantity: Number(order.ordered_quantity),
+    ...(movement ? {
+      inventoryTransactionId: movement.transaction.id,
+      inventoryJournalId: journal.id,
+      productSku: product.sku,
+      warehouseId,
+    } : {}),
   });
   return updated.rows[0];
 }

@@ -796,6 +796,43 @@ export async function getInventoryReports(client, organizationId, reportType, pa
        ORDER BY p.name`, [organizationId]);
     return result.rows;
   }
+  if (reportType === 'stockout-risk') {
+    const result = await client.query(`WITH balances AS (
+       SELECT product_id, warehouse_id,
+         SUM(CASE WHEN direction = 'IN' THEN quantity WHEN direction = 'OUT' THEN -quantity ELSE 0 END) AS on_hand
+       FROM inventory_stock_transactions
+       WHERE organization_id = $1
+       GROUP BY product_id, warehouse_id
+     ), usage AS (
+       SELECT product_id, warehouse_id, SUM(quantity) AS consumed
+       FROM inventory_stock_transactions
+       WHERE organization_id = $1 AND direction = 'OUT'
+         AND transaction_type IN ('SALES_DELIVERY', 'PRODUCTION_CONSUMPTION')
+         AND transaction_date >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+       GROUP BY product_id, warehouse_id
+     ), positions AS (
+       SELECT p.id AS product_id, p.sku, p.name, p.reorder_level, p.reorder_quantity,
+         w.id AS warehouse_id, w.code AS warehouse_code,
+         COALESCE(b.on_hand, 0) AS on_hand, COALESCE(u.consumed, 0) AS consumed_30_days
+       FROM inventory_products p
+       JOIN inventory_warehouses w ON w.organization_id = p.organization_id
+       LEFT JOIN balances b ON b.product_id = p.id AND b.warehouse_id = w.id
+       LEFT JOIN usage u ON u.product_id = p.id AND u.warehouse_id = w.id
+       WHERE p.organization_id = $1 AND p.active = TRUE
+     )
+     SELECT *, consumed_30_days / 30.0 AS average_daily_usage,
+       CASE WHEN consumed_30_days > 0 THEN on_hand / (consumed_30_days / 30.0) ELSE NULL END AS days_of_stock_remaining,
+       GREATEST(reorder_quantity, reorder_level + consumed_30_days - on_hand, 0) AS suggested_replenishment,
+       CASE WHEN on_hand <= reorder_level THEN 'REORDER'
+            WHEN consumed_30_days > 0 AND on_hand / (consumed_30_days / 30.0) <= 30 THEN 'HIGH_RISK'
+            ELSE 'MONITOR' END AS risk_level
+     FROM positions
+     WHERE consumed_30_days > 0 OR on_hand <= reorder_level
+     ORDER BY CASE WHEN on_hand <= reorder_level THEN 0
+                   WHEN consumed_30_days > 0 AND on_hand / (consumed_30_days / 30.0) <= 30 THEN 1 ELSE 2 END,
+       days_of_stock_remaining NULLS LAST, name`, [organizationId]);
+    return result.rows;
+  }
   if (reportType === 'inventory-aging') {
     const result = await client.query(`SELECT p.sku, p.name, w.code AS warehouse_code,
        COALESCE(SUM(CASE WHEN t.direction = 'IN' THEN t.quantity ELSE 0 END), 0) -

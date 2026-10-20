@@ -13,6 +13,7 @@ The manufacturing workspace extends the existing production workflows without re
 
 - Schedule preventive or corrective maintenance against an active work center, with a planned date and optional next-due date.
 - Complete a scheduled event and record actual downtime in minutes. Completed maintenance events remain visible in the schedule for historical reporting.
+- Record unplanned production stoppages with work center, optional active production order, date, duration, reason, and notes. Entries are organization-scoped, auditable, and shown in the planning workspace independently of planned maintenance.
 - Existing work-center calendars and machine-utilization reporting remain unchanged.
 
-Schema additions are applied by `migrations/031_manufacturing_planning_maintenance.sql`. Forecast entry and MRP use the existing `manufacturing:mrp:run` permission; maintenance scheduling and completion use `manufacturing:routing:manage`.
+Forecast and maintenance schema additions are applied by `migrations/031_manufacturing_planning_maintenance.sql`; unplanned stoppage entries use `migrations/039_manufacturing_downtime_log.sql`. Forecast entry and MRP use the existing `manufacturing:mrp:run` permission; maintenance scheduling and completion use `manufacturing:routing:manage`, and downtime entry uses `manufacturing:orders:release`.

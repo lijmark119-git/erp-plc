@@ -17,11 +17,13 @@ const cleanup = {
   deliveryIds: [], salesOrderIds: [], customerIds: [],
   qualityInspectionIds: [],
   forecastIds: [], maintenanceIds: [],
+  downtimeEventIds: [],
 };
 
 after(async () => {
   try {
     await client.query('BEGIN');
+    if (cleanup.downtimeEventIds.length) await client.query('DELETE FROM manufacturing_downtime_events WHERE id=ANY($1::uuid[])', [cleanup.downtimeEventIds]);
     if (cleanup.maintenanceIds.length) await client.query('DELETE FROM manufacturing_maintenance_events WHERE id=ANY($1::uuid[])', [cleanup.maintenanceIds]);
     if (cleanup.forecastIds.length) await client.query('DELETE FROM manufacturing_demand_forecasts WHERE id=ANY($1::uuid[])', [cleanup.forecastIds]);
     if (cleanup.journalIds.length) {
@@ -179,6 +181,25 @@ test('manufacturing plans, reserves, consumes, costs, completes, and traces prod
   const released = await manufacturingService.releaseOrder(client, organizationId, actorId, order.id);
   assert.equal(released.status, 'RELEASED');
   await manufacturingService.startOrder(client, organizationId, actorId, order.id);
+  const downtimeEvent = await manufacturingService.recordDowntimeEvent(client, organizationId, actorId, {
+    workCenterId: center.id,
+    manufacturingOrderId: order.id,
+    downtimeDate: new Date().toISOString().slice(0, 10),
+    downtimeMinutes: 12.5,
+    reason: 'Material shortage',
+    notes: 'Waiting for the next component batch',
+  });
+  cleanup.downtimeEventIds.push(downtimeEvent.id);
+  assert.equal(Number(downtimeEvent.downtime_minutes), 12.5);
+  assert.equal(downtimeEvent.reason, 'Material shortage');
+  const workspace = await manufacturingService.getWorkspace(client, organizationId);
+  assert.equal(workspace.downtimeEvents.some((event) => event.id === downtimeEvent.id), true);
+  await assert.rejects(
+    manufacturingService.recordDowntimeEvent(client, organizationId, actorId, {
+      workCenterId: center.id, downtimeMinutes: 0, reason: 'Invalid duration',
+    }),
+    { status: 400 },
+  );
 
   const consumption = await manufacturingService.consumeMaterial(client, organizationId, actorId, order.id, {
     productId: raw.id, quantity: 264, lotNumber: rawLot.lot_number,

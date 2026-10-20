@@ -267,6 +267,42 @@ export async function closeAccountingPeriod(client, organizationId, actorId, per
   return result.rows[0];
 }
 
+export async function reopenAccountingPeriod(client, organizationId, actorId, periodId, reason) {
+  const periodResult = await client.query(
+    `SELECT id, fiscal_year, period_number, closed_at, closed_by
+     FROM accounting_periods
+     WHERE organization_id = $1 AND id = $2 AND status = 'CLOSED'
+     FOR UPDATE`,
+    [organizationId, periodId],
+  );
+  const period = periodResult.rows[0];
+  if (!period) return null;
+
+  await client.query(
+    `INSERT INTO accounting_period_reopen_history (
+       organization_id, period_id, reopened_by, reason, previous_closed_at, previous_closed_by
+     ) VALUES ($1, $2, $3, $4, $5, $6)`,
+    [organizationId, periodId, actorId, reason, period.closed_at, period.closed_by],
+  );
+  const result = await client.query(
+    `UPDATE accounting_periods
+     SET status = 'OPEN', closed_at = NULL, closed_by = NULL, updated_at = CURRENT_TIMESTAMP
+     WHERE organization_id = $1 AND id = $2 AND status = 'CLOSED'
+     RETURNING id, fiscal_year, period_number, period_start, period_end, status`,
+    [organizationId, periodId],
+  );
+  if (!result.rows[0]) return null;
+
+  await recordAccountingAudit(client, organizationId, actorId, 'accounting_period_reopened', periodId, {
+    fiscalYear: period.fiscal_year,
+    periodNumber: period.period_number,
+    reason,
+    previousClosedAt: period.closed_at,
+    previousClosedBy: period.closed_by,
+  }, 'accounting_period');
+  return result.rows[0];
+}
+
 export async function createAccountingJournal(client, organizationId, actorId, input) {
   const transactionDate = input.transactionDate instanceof Date
     ? input.transactionDate.toISOString().slice(0, 10)

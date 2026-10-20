@@ -19,6 +19,10 @@ let orderId;
 let deliveryId;
 let invoiceId;
 let paymentId;
+let commissionRuleId;
+let createdCommissionRule = false;
+let salesTargetId;
+let previousSalesTarget;
 
 function request(method, url, options = {}, cookie = '') {
   return fetch(`http://127.0.0.1:${server.address().port}${url}`, {
@@ -51,6 +55,8 @@ const sellerPassword = process.env.SELLER_PASSWORD || 'seller123';
 async function cleanSalesFixture() {
   if (customerId) {
     await client.query('DELETE FROM sales_receivable_disputes WHERE organization_id=$1 AND receivable_id IN (SELECT id FROM accounts_receivable WHERE customer_id=$2)', [organizationId, customerId]);
+    await client.query('DELETE FROM sales_audit_trail WHERE organization_id=$1 AND entity_id IN (SELECT id FROM sales_return_requests WHERE delivery_id IN (SELECT id FROM delivery_notes WHERE customer_id=$2))', [organizationId, customerId]);
+    await client.query('DELETE FROM sales_return_requests WHERE organization_id=$1 AND delivery_id IN (SELECT id FROM delivery_notes WHERE customer_id=$2)', [organizationId, customerId]);
     await client.query('DELETE FROM sales_customer_activities WHERE organization_id=$1 AND (customer_id=$2 OR crm_record_id IN (SELECT id FROM sales_crm_records WHERE customer_id=$2))', [organizationId, customerId]);
     await client.query('DELETE FROM sales_crm_records WHERE organization_id=$1 AND customer_id=$2', [organizationId, customerId]);
     await client.query('DELETE FROM sales_audit_trail WHERE organization_id=$1 AND entity_id IN (SELECT id FROM quotations WHERE customer_id=$2 UNION SELECT id FROM sales_orders WHERE customer_id=$2 UNION SELECT id FROM delivery_notes WHERE customer_id=$2 UNION SELECT id FROM customer_invoices WHERE customer_id=$2 UNION SELECT id FROM customer_payments WHERE customer_id=$2 UNION SELECT id FROM customers WHERE id=$2)', [organizationId, customerId]);
@@ -67,18 +73,31 @@ async function cleanSalesFixture() {
     await client.query('DELETE FROM customer_addresses WHERE customer_id=$1', [customerId]);
     await client.query('DELETE FROM customers WHERE id=$1', [customerId]);
   }
+  if (createdCommissionRule && commissionRuleId) await client.query('DELETE FROM sales_commission_rules WHERE id=$1', [commissionRuleId]);
+  if (salesTargetId && previousSalesTarget) {
+    await client.query('UPDATE sales_targets SET target_amount=$1, created_by=$2 WHERE id=$3', [
+      previousSalesTarget.target_amount, previousSalesTarget.created_by, salesTargetId,
+    ]);
+  } else if (salesTargetId) {
+    await client.query('DELETE FROM sales_targets WHERE id=$1', [salesTargetId]);
+  }
   const inventoryTransactions = fixture
     ? (await client.query('SELECT id FROM inventory_stock_transactions WHERE organization_id=$1 AND reference_id=ANY($2::text[])', [organizationId, references])).rows.map((row) => row.id)
     : [];
+  const allFixtureTransactions = fixture
+    ? (await client.query('SELECT id FROM inventory_stock_transactions WHERE organization_id=$1 AND product_id=$2', [organizationId, fixture.product.id])).rows.map((row) => row.id)
+    : [];
+  const transactionIds = [...new Set([...inventoryTransactions, ...allFixtureTransactions])];
   const sourceIds = [...references, ...inventoryTransactions, ...(invoiceId ? [`invoice:${invoiceId}`] : []), ...(paymentId ? [`payment:${paymentId}`] : [])];
   if (sourceIds.length) {
-    const journalIds = (await client.query("SELECT id FROM accounting_journals WHERE organization_id=$1 AND ((source_module='inventory' AND source_transaction_id=ANY($2::text[])) OR (source_module='sales' AND source_transaction_id=ANY($3::text[])))", [organizationId, inventoryTransactions, sourceIds])).rows.map((row) => row.id);
+    const journalIds = (await client.query("SELECT id FROM accounting_journals WHERE organization_id=$1 AND ((source_module='inventory' AND source_transaction_id=ANY($2::text[])) OR (source_module='sales' AND source_transaction_id=ANY($3::text[])))", [organizationId, transactionIds, sourceIds])).rows.map((row) => row.id);
     if (journalIds.length) {
       await client.query("DELETE FROM audit_events WHERE entity_type='accounting_journal' AND entity_id=ANY($1::text[])", [journalIds]);
       await client.query('DELETE FROM accounting_journals WHERE id=ANY($1::uuid[])', [journalIds]);
     }
   }
   if (fixture) {
+    if (transactionIds.length) await client.query('DELETE FROM manufacturing_lots WHERE source_inventory_transaction_id=ANY($1::uuid[])', [transactionIds]);
     await client.query('DELETE FROM inventory_stock_transactions WHERE organization_id=$1 AND (reference_id=ANY($2::text[]) OR product_id=$3)', [organizationId, references, fixture.product.id]);
     await client.query('DELETE FROM inventory_locations WHERE warehouse_id=$1', [fixture.warehouse.id]);
     await client.query('DELETE FROM inventory_warehouses WHERE id=$1', [fixture.warehouse.id]);
@@ -145,6 +164,15 @@ test('sales quote-to-cash workflow posts inventory, invoice, payment, reports, a
   const crmWorkspace = await request('GET', '/api/sales/crm', {}, adminCookie);
   assert.ok(crmWorkspace.body.records.some((record) => record.id === crmRecord.body.id));
   assert.ok(crmWorkspace.body.activities.some((activity) => activity.id === crmActivity.body.id));
+  const movedCrmRecord = await request('PUT', `/api/sales/crm/${crmRecord.body.id}`, {
+    body: JSON.stringify({ stage: 'PROPOSAL' }),
+  }, adminCookie);
+  assert.equal(movedCrmRecord.status, 200);
+  assert.equal(movedCrmRecord.body.stage, 'PROPOSAL');
+  const unauthorizedCrmUpdate = await request('PUT', `/api/sales/crm/${crmRecord.body.id}`, {
+    body: JSON.stringify({ stage: 'WON' }),
+  }, await login(sellerUsername, sellerPassword));
+  assert.equal(unauthorizedCrmUpdate.status, 403);
 
   const line = { productSku: product.sku, productName: product.name, quantity: 4, unitPrice: 120, discountPercent: 10, taxPercent: 15 };
   const held = await request('POST', `/api/sales/customers/${customerId}/credit-hold`, {
@@ -180,16 +208,88 @@ test('sales quote-to-cash workflow posts inventory, invoice, payment, reports, a
   await request('PUT', `/api/sales/customers/${customerId}`, {
     body: JSON.stringify({ creditLimit: 10000 }),
   }, adminCookie);
+  const priceList = await request('POST', '/api/sales/price-lists', {
+    body: JSON.stringify({
+      customerId,
+      name: `Preferred pricing ${suffix}`,
+      currency: 'ETB',
+      lines: [{ productSku: product.sku, unitPrice: 115 }],
+    }),
+  }, adminCookie);
+  assert.equal(priceList.status, 201);
+  const listedPrices = await request('GET', '/api/sales/price-lists', {}, adminCookie);
+  assert.ok(listedPrices.body.some((item) => item.id === priceList.body.id));
+  const unauthorizedPrice = await request('POST', '/api/sales/orders', {
+    body: JSON.stringify({
+      customerId, idempotencyKey: randomUUID(),
+      lines: [{ ...line, quantity: 1, unitPrice: 120 }],
+    }),
+  }, sellerCookie);
+  assert.equal(unauthorizedPrice.status, 403);
+  const approvedListPriceOrder = await request('POST', '/api/sales/orders', {
+    body: JSON.stringify({
+      customerId, idempotencyKey: randomUUID(),
+      lines: [{ ...line, quantity: 1, unitPrice: 115 }],
+    }),
+  }, sellerCookie);
+  assert.equal(approvedListPriceOrder.status, 201);
+  await request('POST', `/api/sales/orders/${approvedListPriceOrder.body.id}/cancel`, {
+    body: JSON.stringify({ reason: 'Price validation test cleanup' }),
+  }, adminCookie);
+  const validityDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+  const idempotencyKey = randomUUID();
+  const orderInput = { customerId, deliveryDate: validityDate, lines: [{ ...line, quantity: 1 }], idempotencyKey };
+  const createdOrder = await request('POST', '/api/sales/orders', {
+    body: JSON.stringify(orderInput),
+  }, adminCookie);
+  assert.equal(createdOrder.status, 201);
+  const replayedOrder = await request('POST', '/api/sales/orders', {
+    body: JSON.stringify(orderInput),
+  }, adminCookie);
+  assert.equal(replayedOrder.status, 201);
+  assert.equal(replayedOrder.body.id, createdOrder.body.id);
+  assert.equal(replayedOrder.body.idempotentReplay, true);
+  const mismatchedReplay = await request('POST', '/api/sales/orders', {
+    body: JSON.stringify({ ...orderInput, lines: [{ ...line, quantity: 2 }] }),
+  }, adminCookie);
+  assert.equal(mismatchedReplay.status, 409);
+  const orderList = await request('GET', '/api/sales/orders', {}, adminCookie);
+  const createdOrderListed = orderList.body.find((order) => order.id === createdOrder.body.id);
+  assert.equal(createdOrderListed.lines.length, 1);
+  const unauthorizedCancel = await request('POST', `/api/sales/orders/${createdOrder.body.id}/cancel`, {
+    body: JSON.stringify({ reason: 'Unauthorized cancellation attempt' }),
+  }, sellerCookie);
+  assert.equal(unauthorizedCancel.status, 403);
+  const amendment = await request('POST', `/api/sales/orders/${createdOrder.body.id}/amend`, {
+    body: JSON.stringify({ reason: 'Customer requested a revised delivery date', deliveryDate: validityDate }),
+  }, adminCookie);
+  assert.equal(amendment.status, 200);
+  const cancelledOrder = await request('POST', `/api/sales/orders/${createdOrder.body.id}/cancel`, {
+    body: JSON.stringify({ reason: 'Customer withdrew the draft request' }),
+  }, adminCookie);
+  assert.equal(cancelledOrder.status, 200);
+  assert.equal(cancelledOrder.body.status, 'Cancelled');
+  const customerInsights = await request('GET', '/api/sales/customer-insights', {}, adminCookie);
+  const customerInsight = customerInsights.body.find((item) => item.customer_id === customerId);
+  assert.equal(customerInsight.segment, 'PROSPECT');
+
   const creditAudit = await request('GET', '/api/sales/audit', {}, adminCookie);
   assert.ok(creditAudit.body.some((entry) => entry.entity_id === customerId && entry.action === 'customer_credit_hold_placed' && entry.changes.reason === 'Past due balance under review'));
   assert.ok(creditAudit.body.some((entry) => entry.entity_id === customerId && entry.action === 'customer_credit_hold_released' && entry.changes.reason === 'Payment plan approved'));
-  const validityDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+  assert.ok(creditAudit.body.some((entry) => entry.entity_id === createdOrder.body.id && entry.action === 'sales_order_amended'));
+  assert.ok(creditAudit.body.some((entry) => entry.entity_id === createdOrder.body.id && entry.action === 'sales_order_cancelled'));
   const quote = await request('POST', '/api/sales/quotations', {
     body: JSON.stringify({ customerId, validityDate, lines: [line], terms: 'Net 30' }),
   }, adminCookie);
   assert.equal(quote.status, 201);
   assert.equal(Number(quote.body.total), 496.8);
   quotationId = quote.body.id;
+  const quoteRevision = await request('POST', `/api/sales/quotations/${quotationId}/revise`, {
+    body: JSON.stringify({}),
+  }, adminCookie);
+  assert.equal(quoteRevision.status, 200);
+  assert.equal(quoteRevision.body.revision_number, 2);
+  assert.equal(Number(quoteRevision.body.total), Number(quote.body.total));
   assert.equal((await request('POST', `/api/sales/quotations/${quotationId}/submit`, {}, adminCookie)).status, 200);
   assert.equal((await request('POST', `/api/sales/quotations/${quotationId}/decision`, { body: JSON.stringify({ status: 'Approved' }) }, sellerCookie)).status, 403);
   const quoteApproval = await request('POST', `/api/sales/quotations/${quotationId}/decision`, { body: JSON.stringify({ status: 'Approved' }) }, adminCookie);
@@ -210,11 +310,55 @@ test('sales quote-to-cash workflow posts inventory, invoice, payment, reports, a
   }, adminCookie);
   assert.equal(delivery.status, 201);
   deliveryId = delivery.body.id;
-  for (const status of ['Picking', 'Packed', 'Shipped', 'Delivered']) {
+  for (const status of ['Picking', 'Packed', 'Shipped']) {
     const result = await request('POST', `/api/sales/deliveries/${deliveryId}/status`, { body: JSON.stringify({ status }) }, adminCookie);
     assert.equal(result.status, 200);
   }
   assert.equal(Number((await inventoryService.getStockBalance(client, organizationId, product.id, warehouse.id)).quantity), 16);
+  const delivered = await request('POST', `/api/sales/deliveries/${deliveryId}/status`, {
+    body: JSON.stringify({ status: 'Delivered', recipientName: 'Receiving contact', proofOfDeliveryRef: `POD-${suffix}` }),
+  }, adminCookie);
+  assert.equal(delivered.status, 200);
+  assert.equal(delivered.body.recipient_name, 'Receiving contact');
+  assert.equal(delivered.body.proof_of_delivery_ref, `POD-${suffix}`);
+  assert.ok(delivered.body.delivered_at);
+  const returnRequest = await request('POST', `/api/sales/deliveries/${deliveryId}/return-requests`, {
+    body: JSON.stringify({ reason: 'Customer reported unopened goods' }),
+  }, adminCookie);
+  assert.equal(returnRequest.status, 201);
+  const returnDecision = await request('POST', `/api/sales/return-requests/${returnRequest.body.id}/decision`, {
+    body: JSON.stringify({ decision: 'APPROVED', resolution: 'Return authorized after inspection' }),
+  }, adminCookie);
+  assert.equal(returnDecision.status, 200);
+  assert.equal(returnDecision.body.status, 'APPROVED');
+  assert.equal(Number((await inventoryService.getStockBalance(client, organizationId, product.id, warehouse.id)).quantity), 16);
+  const deliveryLines = (await client.query('SELECT id, delivered_qty FROM delivery_line_items WHERE delivery_id=$1', [deliveryId])).rows;
+  const inspectionInput = {
+    notes: 'One unit held for quality review.',
+    lines: deliveryLines.map((line) => ({
+        deliveryLineId: line.id,
+        receivedQuantity: Number(line.delivered_qty),
+        restockQuantity: Number(line.delivered_qty) - 1,
+        quarantineQuantity: 1,
+        damagedQuantity: 0,
+    })),
+  };
+  const returnInspection = await request('POST', `/api/sales/return-requests/${returnRequest.body.id}/inspection`, {
+    body: JSON.stringify(inspectionInput),
+  }, adminCookie);
+  assert.equal(returnInspection.status, 200);
+  assert.equal(Number((await inventoryService.getStockBalance(client, organizationId, product.id, warehouse.id)).quantity), 20);
+  assert.equal(Number((await client.query(
+    `SELECT COALESCE(SUM(remaining_quantity),0) AS quantity FROM manufacturing_lots
+     WHERE organization_id=$1 AND product_id=$2 AND quality_status='QUARANTINED' AND lot_number LIKE $3`,
+    [organizationId, product.id, `RET-${returnRequest.body.id.slice(0, 8)}-%`],
+  )).rows[0].quantity), 1);
+  const duplicateInspection = await request('POST', `/api/sales/return-requests/${returnRequest.body.id}/inspection`, {
+    body: JSON.stringify(inspectionInput),
+  }, adminCookie);
+  assert.equal(duplicateInspection.status, 409);
+  const returnStatus = await client.query('SELECT status FROM delivery_notes WHERE id=$1', [deliveryId]);
+  assert.equal(returnStatus.rows[0].status, 'Returned');
 
   const dueDate = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
   const invoice = await request('POST', '/api/sales/invoices', {
@@ -224,6 +368,43 @@ test('sales quote-to-cash workflow posts inventory, invoice, payment, reports, a
   invoiceId = invoice.body.id;
   const issued = await request('POST', `/api/sales/invoices/${invoiceId}/issue`, {}, adminCookie);
   assert.equal(issued.status, 200);
+  const month = new Date().toISOString().slice(0, 7);
+  const activeRule = (await client.query(
+    `SELECT id FROM sales_commission_rules
+     WHERE organization_id=$1 AND salesperson_id=$2 AND active=TRUE
+       AND effective_from <= CURRENT_DATE AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+     ORDER BY effective_from DESC LIMIT 1`,
+    [organizationId, adminUser.id],
+  )).rows[0];
+  if (activeRule) {
+    commissionRuleId = activeRule.id;
+  } else {
+    const commissionRule = await request('POST', '/api/sales/commission-rules', {
+      body: JSON.stringify({ salespersonId: adminUser.id, ratePercent: 5, effectiveFrom: `${month}-01` }),
+    }, adminCookie);
+    assert.equal(commissionRule.status, 200, commissionRule.body.error);
+    commissionRuleId = commissionRule.body.id;
+    createdCommissionRule = true;
+  }
+  previousSalesTarget = (await client.query(
+    'SELECT id, target_amount, created_by FROM sales_targets WHERE organization_id=$1 AND salesperson_id=$2 AND target_month=$3',
+    [organizationId, adminUser.id, `${month}-01`],
+  )).rows[0] || null;
+  const target = await request('POST', '/api/sales/targets', {
+    body: JSON.stringify({ salespersonId: adminUser.id, targetMonth: `${month}-01`, targetAmount: 1000 }),
+  }, adminCookie);
+  assert.equal(target.status, 200);
+  salesTargetId = target.body.id;
+  const performance = await request('GET', `/api/sales/performance?startDate=${month}-01&endDate=${new Date().toISOString().slice(0, 10)}`, {}, adminCookie);
+  assert.equal(performance.status, 200);
+  assert.ok(performance.body.targetVsActual.some((item) => item.salesperson_id === adminUser.id && Number(item.actual_amount) >= Number(invoice.body.total) - Number(invoice.body.tax_amount)));
+  assert.ok(performance.body.commissions.some((item) => item.rule_id === commissionRuleId && Number(item.estimated_commission) > 0));
+  assert.ok(Number.isFinite(performance.body.forecast.nextMonthNetSales));
+  const purchasedCustomerInsight = (await request('GET', '/api/sales/customer-insights', {}, adminCookie))
+    .body.find((item) => item.customer_id === customerId);
+  assert.equal(Number(purchasedCustomerInsight.purchase_count), 1);
+  assert.equal(Number(purchasedCustomerInsight.lifetime_value), 496.8);
+  assert.equal(purchasedCustomerInsight.segment, 'NEW');
   const invoiceJournal = await client.query("SELECT j.id FROM accounting_journals j WHERE j.organization_id=$1 AND j.source_module='sales' AND j.source_transaction_id=$2", [organizationId, `invoice:${invoiceId}`]);
   assert.ok(invoiceJournal.rows[0]);
   const invoiceReceivable = (await client.query('SELECT id FROM accounts_receivable WHERE invoice_id=$1 AND organization_id=$2', [invoiceId, organizationId])).rows[0];

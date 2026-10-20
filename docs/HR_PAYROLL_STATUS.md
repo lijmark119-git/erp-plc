@@ -7,6 +7,7 @@ HR and payroll are implemented as additions to the existing ERP. Existing authen
 - Create and edit employees with a unique employee number, personal and contact details, emergency contact, department, position, branch, employment type, hire date, contract, salary, allowances, deductions, and status.
 - Terminate employees without deleting their attendance or payroll history.
 - Maintain departments, positions, branches, and employee-linked hierarchy nodes.
+- Register employee document metadata with optional expiry dates and references. Expired and soon-to-expire statuses are calculated at read time; uploaded file contents are not stored.
 
 ## Attendance and leave
 
@@ -41,6 +42,7 @@ The payment step records the accounting journal and marks the payroll period pai
 ## Persistence, permissions, and audit
 
 - With `DATABASE_URL` configured, HR records are persisted by organization in PostgreSQL `hr_workspaces` JSONB, and workspace updates and associated payroll ledger posting share a database transaction.
+- Employee document metadata is stored separately by organization. Separate document read/manage permissions are granted to administrators only by default; access does not expose documents to manager or employee roles without explicit permission assignment.
 - Without PostgreSQL configured, the existing JSON-file development fallback is retained.
 - Payroll journals use the existing accounting journal service, including accounting-period checks, journal numbering, audit events, and the posted general ledger.
 - HR actions are protected by the existing HR/RBAC permission checks and recorded in the HR audit trail. Payroll rule configuration is ADMIN-only.
@@ -59,6 +61,7 @@ The payment step records the accounting journal and marks the payroll period pai
 - Leave: `GET /api/hr/leave`, `GET /api/hr/leave/calendar`, `POST /api/hr/leave/types`, `POST /api/hr/leave/requests`, `POST /api/hr/leave/requests/:id/approve`
 - Payroll: `GET /api/hr/payroll`, `POST /api/hr/payroll/settings`, `POST /api/hr/payroll/periods`, and `POST /api/hr/payroll/periods/:id/{calculate,review,approve,post,pay}`
 - Payslips and reports: `GET /api/hr/payroll/payslip/:employeeId`, `GET /api/hr/payroll/reports`, `GET /api/hr/reports`, `GET /api/hr/audit`
+- Employee documents: `GET /api/hr/employee-documents`, `POST /api/hr/employee-documents`
 
 ## Database setup and verification
 
@@ -68,6 +71,6 @@ Apply pending schema updates with:
 npm run db:migrate
 ```
 
-The HR workspace and payroll-account migrations are additive. Payroll posting requires the seeded account codes listed above. The journal sequence is keyed by organization and fiscal year.
+The HR workspace, payroll-account, and employee-document migrations are additive. Payroll posting requires the seeded account codes listed above. The journal sequence is keyed by organization and fiscal year.
 
 Verification performed: all 28 existing Node tests passed, including HR API, payroll workflow, RBAC, and accounting journal tests.

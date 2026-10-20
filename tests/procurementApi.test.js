@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import test, { after } from 'node:test';
 
 import { app, databasePool } from '../server.js';
+import { inventoryService } from '../services/inventoryService.js';
 
 async function startServer() {
   const server = app.listen(0, '127.0.0.1');
@@ -38,10 +40,33 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
   let orderId;
   let requisitionId;
   let supplierInvoiceId;
+  let inventoryClient;
+  let inventoryFixture;
 
   try {
     const cookie = await login(baseUrl);
     const suffix = `${Date.now()}`;
+    inventoryClient = await databasePool.connect();
+    const organizationId = (await inventoryClient.query(
+      'SELECT id FROM organizations WHERE code=$1',
+      ['DEFAULT'],
+    )).rows[0].id;
+    const actorId = (await inventoryClient.query(
+      'SELECT id FROM users WHERE organization_id=$1 AND LOWER(username)=LOWER($2)',
+      [organizationId, process.env.ADMIN_USERNAME || 'admin'],
+    )).rows[0].id;
+    const uom = await inventoryService.createUom(inventoryClient, organizationId, actorId, {
+      code: `PR-${suffix}`, name: 'Procurement receipt test unit', baseUnit: 'each', factor: 1,
+    });
+    const product = await inventoryService.createProduct(inventoryClient, organizationId, actorId, {
+      sku: `PR-${suffix}`, name: `Procurement stock fixture ${suffix}`, productType: 'TRADING_PRODUCT',
+      unitOfMeasureId: uom.id, standardCost: 100, inventoryAccountCode: '1200',
+      cogsAccountCode: '5000', grniAccountCode: '2000',
+    });
+    const warehouse = await inventoryService.createWarehouse(inventoryClient, organizationId, actorId, {
+      code: `PR-${suffix}`, name: `Procurement receipt warehouse ${suffix}`,
+    });
+    inventoryFixture = { organizationId, actorId, uom, product, warehouse };
     const supplierOne = await request(baseUrl, cookie, '/api/procurement/suppliers', 'POST', {
       supplierCode: `TST-A-${suffix}`,
       name: `Test Supplier A ${suffix}`,
@@ -60,6 +85,14 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     });
     assert.equal(supplierTwo.response.status, 201);
     createdSupplierIds.push(supplierTwo.body.id);
+    const supplierDocument = await request(baseUrl, cookie, '/api/procurement/supplier-documents', 'POST', {
+      supplierId: supplierOne.body.id,
+      documentType: 'Certification',
+      documentName: 'Test quality certification',
+      expiryDate: '2027-12-31',
+      referenceUrl: 'https://example.org/certification',
+    });
+    assert.equal(supplierDocument.response.status, 201, supplierDocument.body.error);
 
     const overBudget = await request(baseUrl, cookie, '/api/procurement/requisitions', 'POST', {
       title: 'Over budget request', description: 'Budget guard test', quantity: 5, estimatedUnitCost: 100, budgetLimit: 400,
@@ -87,6 +120,7 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     const comparison = await request(baseUrl, cookie, '/api/procurement/comparisons', 'POST', {
       title: `Procurement test ${suffix}`,
       productDescription: 'Comparison fixture',
+      sku: `PR-${suffix}`,
       quantity: 5,
       currency: 'ETB',
       quotes: [
@@ -118,19 +152,38 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     assert.equal(approval.response.status, 200, approval.body.error);
     assert.equal(approval.body.status, 'APPROVED');
 
-    const partialReceipt = await request(baseUrl, cookie, `/api/procurement/orders/${orderId}/receive`, 'POST', {
-      quantity: 2,
-      reason: 'First delivery',
-    });
+    const firstReceiptInput = {
+      quantity: 2, productSku: product.sku, warehouseId: warehouse.id,
+      reason: 'First delivery', idempotencyKey: randomUUID(),
+    };
+    const partialReceipt = await request(baseUrl, cookie, `/api/procurement/orders/${orderId}/receive`, 'POST', firstReceiptInput);
     assert.equal(partialReceipt.response.status, 200, partialReceipt.body.error);
     assert.equal(partialReceipt.body.status, 'PARTIALLY_RECEIVED');
+    assert.equal(Number((await inventoryService.getStockBalance(inventoryClient, organizationId, product.id, warehouse.id)).quantity), 2);
+    const retriedReceipt = await request(baseUrl, cookie, `/api/procurement/orders/${orderId}/receive`, 'POST', firstReceiptInput);
+    assert.equal(retriedReceipt.response.status, 200, retriedReceipt.body.error);
+    assert.equal(retriedReceipt.body.idempotentReplay, true);
+    assert.equal(Number((await inventoryService.getStockBalance(inventoryClient, organizationId, product.id, warehouse.id)).quantity), 2);
 
     const finalReceipt = await request(baseUrl, cookie, `/api/procurement/orders/${orderId}/receive`, 'POST', {
-      quantity: 3,
-      reason: 'Balance delivered',
+      quantity: 3, productSku: product.sku, warehouseId: warehouse.id,
+      reason: 'Balance delivered', idempotencyKey: randomUUID(),
     });
     assert.equal(finalReceipt.response.status, 200, finalReceipt.body.error);
     assert.equal(finalReceipt.body.status, 'RECEIVED');
+    assert.equal(Number((await inventoryService.getStockBalance(inventoryClient, organizationId, product.id, warehouse.id)).quantity), 5);
+    const postedReceiptJournals = await inventoryClient.query(
+      `SELECT journal.status
+       FROM procurement_purchase_order_receipts receipt
+       JOIN accounting_journals journal
+         ON journal.organization_id=receipt.organization_id
+        AND journal.source_module='inventory'
+        AND journal.source_transaction_id=receipt.inventory_transaction_id::text
+       WHERE receipt.purchase_order_id=$1`,
+      [orderId],
+    );
+    assert.equal(postedReceiptJournals.rowCount, 2);
+    assert.ok(postedReceiptJournals.rows.every((journal) => journal.status === 'POSTED'));
     const supplierInvoice = await request(baseUrl, cookie, '/api/procurement/supplier-invoices', 'POST', {
       purchaseOrderId: orderId, supplierInvoiceNumber: `INV-${suffix}`, invoiceQuantity: 5, invoiceAmount: 580,
     });
@@ -141,6 +194,9 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     assert.equal(invoiceMatch.body.status, 'MATCHED');
 
     const workspace = await request(baseUrl, cookie, '/api/procurement/workspace');
+    const savedDocument = workspace.body.supplierDocuments.find((item) => item.id === supplierDocument.body.id);
+    assert.equal(savedDocument.expiry_status, 'CURRENT');
+    assert.equal(savedDocument.supplier_id, supplierOne.body.id);
     const savedComparison = workspace.body.comparisons.find((item) => item.id === comparisonId);
     const savedOrder = workspace.body.orders.find((item) => item.id === orderId);
     assert.equal(savedComparison.status, 'ORDERED');
@@ -153,6 +209,26 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
     );
   } finally {
     if (databasePool && comparisonId) {
+      if (orderId) {
+        const transactionIds = (await databasePool.query(
+          'SELECT inventory_transaction_id FROM procurement_purchase_order_receipts WHERE purchase_order_id=$1 AND inventory_transaction_id IS NOT NULL',
+          [orderId],
+        )).rows.map((row) => row.inventory_transaction_id);
+        if (transactionIds.length) {
+          const journalIds = (await databasePool.query(
+            `SELECT id FROM accounting_journals
+             WHERE organization_id=$1 AND source_module='inventory'
+               AND source_transaction_id=ANY($2::text[])`,
+            [inventoryFixture.organizationId, transactionIds],
+          )).rows.map((row) => row.id);
+          if (journalIds.length) {
+            await databasePool.query("DELETE FROM audit_events WHERE entity_type='accounting_journal' AND entity_id=ANY($1::text[])", [journalIds]);
+            await databasePool.query('DELETE FROM accounting_journals WHERE id=ANY($1::uuid[])', [journalIds]);
+          }
+          await databasePool.query('DELETE FROM procurement_purchase_order_receipts WHERE purchase_order_id=$1', [orderId]);
+          await databasePool.query('DELETE FROM inventory_stock_transactions WHERE id=ANY($1::uuid[])', [transactionIds]);
+        }
+      }
       if (supplierInvoiceId) {
         await databasePool.query('DELETE FROM procurement_audit_history WHERE entity_id=$1', [supplierInvoiceId]);
         await databasePool.query('DELETE FROM procurement_supplier_invoices WHERE id=$1', [supplierInvoiceId]);
@@ -175,6 +251,12 @@ test('procurement comparisons persist quotes, selection, approvals, receipts, an
       );
       await databasePool.query('DELETE FROM procurement_suppliers WHERE id = ANY($1::uuid[])', [createdSupplierIds]);
     }
+    if (inventoryFixture) {
+      await databasePool.query('DELETE FROM inventory_warehouses WHERE id=$1', [inventoryFixture.warehouse.id]);
+      await databasePool.query('DELETE FROM inventory_products WHERE id=$1', [inventoryFixture.product.id]);
+      await databasePool.query('DELETE FROM inventory_uoms WHERE id=$1', [inventoryFixture.uom.id]);
+    }
+    inventoryClient?.release();
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 });

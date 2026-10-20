@@ -18,6 +18,7 @@ import {
   getFinancialStatement,
   getTrialBalance,
   postAccountingJournal,
+  reopenAccountingPeriod,
   reverseAccountingJournal,
   saveAccountingBudgetLine,
   submitAccountingJournal,
@@ -115,6 +116,14 @@ export const accountingService = {
 
   async closePeriod(client, organizationId, actorId, periodId) {
     return closeAccountingPeriod(client, organizationId, actorId, periodId);
+  },
+
+  async reopenPeriod(client, organizationId, actorId, periodId, input) {
+    const reason = String(input?.reason || '').trim();
+    if (!reason || reason.length > 500) {
+      throw new Error('A reopening reason of up to 500 characters is required.');
+    }
+    return reopenAccountingPeriod(client, organizationId, actorId, periodId, reason);
   },
 
   async createJournal(client, organizationId, actorId, input) {

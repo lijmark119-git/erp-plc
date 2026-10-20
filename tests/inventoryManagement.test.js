@@ -509,3 +509,25 @@ test('product master, uom conversions, adjustments, stock counts, valuation, and
   const reorderReport = await inventoryService.getReports(client, organizationId, 'low-stock');
   assert.ok(Array.isArray(reorderReport));
 });
+
+test('stockout risk report estimates coverage and replenishment from recent ledger demand', async () => {
+  const fixture = await createTestFixture();
+  await inventoryService.receive(client, organizationId, actorId, {
+    productId: fixture.product.id, warehouseId: fixture.source.id,
+    quantity: 20, unitCost: 10, referenceType: 'PURCHASE_RECEIPT', referenceId: `RISK-RECEIPT-${randomUUID()}`,
+  });
+  await inventoryService.issue(client, organizationId, actorId, {
+    productId: fixture.product.id, warehouseId: fixture.source.id,
+    quantity: 7, unitCost: 10, referenceType: 'PRODUCTION_CONSUMPTION', referenceId: `RISK-ISSUE-${randomUUID()}`,
+  });
+
+  const report = await inventoryService.getReports(client, organizationId, 'stockout-risk');
+  const row = report.find((item) => item.product_id === fixture.product.id && item.warehouse_id === fixture.source.id);
+
+  assert.ok(row);
+  assert.equal(Number(row.on_hand), 13);
+  assert.equal(Number(row.consumed_30_days), 7);
+  assert.equal(Number(row.days_of_stock_remaining), 13 / (7 / 30));
+  assert.equal(row.risk_level, 'MONITOR');
+  assert.equal(Number(row.suggested_replenishment), 5);
+});
