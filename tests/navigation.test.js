@@ -7,6 +7,7 @@ import { DEFAULT_ROLE_PERMISSIONS } from '../authorization.js';
 import { getNavigationForDisplay, getNavigationKeyFromHash, getVisibleNavigation, resolveNavigationRoute } from '../src/navigation.js';
 
 const stylesPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'styles.css');
+const mainPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'main.js');
 
 function keysFor(role) {
   return getVisibleNavigation(DEFAULT_ROLE_PERMISSIONS[role])
@@ -93,4 +94,14 @@ test('Navigation responds to changed session permissions instead of hard-coded r
     ['dashboard', 'sales', 'reports'],
   );
   assert.equal(resolveNavigationRoute('customers', changedPermissions), null);
+});
+
+test('Recently visited links can be removed without changing favorites', () => {
+  const main = fs.readFileSync(mainPath, 'utf8');
+  const styles = fs.readFileSync(stylesPath, 'utf8');
+
+  assert.match(main, /function removeRecentPage\(key\)[\s\S]*?setNavigationPreferences\('recent', getNavigationPreferences\('recent'\)\.filter\(\(recent\) => recent !== key\)\)/);
+  assert.match(main, /data-remove-recent="\$\{escapeHtml\(page\.key\)\}"/);
+  assert.match(main, /button\.addEventListener\('click', \(\) => removeRecentPage\(button\.dataset\.removeRecent\)\)/);
+  assert.match(styles, /\.quick-navigation \.quick-nav-entry\s*\{\s*display:\s*flex;/);
 });

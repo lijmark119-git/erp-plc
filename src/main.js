@@ -132,6 +132,11 @@ function recordRecentPage(key) {
   setNavigationPreferences('recent', [key, ...recent]);
 }
 
+function removeRecentPage(key) {
+  setNavigationPreferences('recent', getNavigationPreferences('recent').filter((recent) => recent !== key));
+  render();
+}
+
 function toggleFavoritePage(key) {
   const favorites = getNavigationPreferences('favorites');
   setNavigationPreferences('favorites', favorites.includes(key)
@@ -148,7 +153,11 @@ function renderQuickNavigation() {
     .map((page) => `<button type="button" class="quick-nav-link" data-route-key="${escapeHtml(page.key)}">${escapeHtml(page.label)}</button>`)
     .join('');
   const favorites = getButtons(getNavigationPreferences('favorites'));
-  const recent = getButtons(getNavigationPreferences('recent'));
+  const recent = getNavigationPreferences('recent')
+    .map((key) => available.find((page) => page.key === key))
+    .filter(Boolean)
+    .map((page) => `<div class="quick-nav-entry"><button type="button" class="quick-nav-link" data-route-key="${escapeHtml(page.key)}">${escapeHtml(page.label)}</button><button type="button" class="quick-nav-remove" data-remove-recent="${escapeHtml(page.key)}" aria-label="Remove ${escapeHtml(page.label)} from recently visited" title="Remove from recently visited">×</button></div>`)
+    .join('');
   if (!favorites && !recent) return '';
   return `<section class="quick-navigation" aria-label="Quick navigation">
     ${favorites ? `<div><strong>Favorites</strong>${favorites}</div>` : ''}
@@ -4502,6 +4511,9 @@ function render() {
     button.addEventListener('click', () => sendAssistantMessage(button.dataset.assistantPrompt));
   });
   document.querySelector('[data-favorite-toggle]')?.addEventListener('click', () => toggleFavoritePage(navigationState.key));
+  document.querySelectorAll('[data-remove-recent]').forEach((button) => {
+    button.addEventListener('click', () => removeRecentPage(button.dataset.removeRecent));
+  });
   document.querySelector('.assistant-panel')?.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       assistantState.open = false;
